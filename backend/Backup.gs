@@ -14,7 +14,7 @@ function backupPeriod_(period){
   var jsonl=events.map(function(e){return JSON.stringify(e);}).join('\n')+(events.length?'\n':''),csv=csv_(events),state=state_();
   var metadata={schema_version:1,period:period,config:state.config,current:state.current,revision:state.revision,annual_summary:repository_().getAnnual(year),daily_summary:b?rows_(b.getSheetByName('daily_summary'),TimeCore.SUMMARY_HEADERS.length).map(TimeCore.summaryFromRow):[],file_index:rows_(master_().getSheetByName('file_index'),4)};
   var contents=[{name:base+'-events.jsonl',text:jsonl,type:'application/x-ndjson'},{name:base+'-events.csv',text:csv,type:'text/csv'},{name:base+'-metadata.json',text:JSON.stringify(metadata,null,2),type:'application/json'}];
-  var files=contents.map(function(c){var file=folder.createFile(c.name,c.text,c.type);return {name:c.name,file_id:file.getId(),sha256:hash_(c.text),bytes:Utilities.newBlob(c.text).getBytes().length};});
+  var files=contents.map(function(c){var blob=Utilities.newBlob(c.text,c.type,c.name),file=folder.createFile(blob);return {name:c.name,file_id:file.getId(),sha256:hash_(c.text),bytes:blob.getBytes().length};});
   var manifest={schema_version:1,period:period,generated_at:new Date().toISOString(),record_count:events.length,selection:'event start local month/year; cross-boundary intervals stored whole',files:files};
   var mf=folder.createFile(base+'-manifest.json',JSON.stringify(manifest,null,2),'application/json');
   upsert_(master_().getSheetByName('backup_index'),period,[period,mf.getId(),manifest.generated_at,events.length,false]);
