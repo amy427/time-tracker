@@ -1,0 +1,6 @@
+/* Offline verifier. No network, credentials or Google account required. */
+const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto'),C=require('../frontend/core.js');
+try{const mf=path.resolve(process.argv[2]||''),manifest=JSON.parse(fs.readFileSync(mf,'utf8'));C.assert(manifest.schema_version===1&&Array.isArray(manifest.files),'不支持的 manifest');const base=path.dirname(mf);let events;
+for(const entry of manifest.files){const file=path.resolve(base,entry.name);C.assert(path.dirname(file)===base,'文件名不能越出备份目录');const bytes=fs.readFileSync(file);C.assert(bytes.length===entry.bytes,'字节数不符 '+entry.name);C.assert(crypto.createHash('sha256').update(bytes).digest('hex')===entry.sha256,'SHA-256 不符 '+entry.name);if(entry.name.endsWith('.jsonl'))events=bytes.toString('utf8').split('\n').filter(Boolean).map(line=>{const raw=JSON.parse(line),e=C.validateEvent(raw);C.assert(e.duration_seconds===raw.duration_seconds,'秒数不符');return e;});}
+C.assert(events&&events.length===manifest.record_count,'记录数不符');C.assert(new Set(events.map(e=>e.event_id)).size===events.length,'UUID 重复');console.log('校验通过：'+manifest.period+'，'+events.length+' 条，'+events.reduce((n,e)=>n+e.duration_seconds,0)+' 秒');}
+catch(err){console.error('校验失败：'+err.message);process.exitCode=1;}

@@ -1,0 +1,25 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>IndexedDB 可靠性验收</title><link rel="stylesheet" href="/style.css"><h1>浏览器可靠性测试</h1><p>使用独立临时数据库，不操作主应用或云端数据。网络恢复与回执丢失在此模拟。</p><button id="run">运行 IndexedDB 测试</button><pre id="result">尚未运行</pre><script src="/core.js?qa=1"></script><script src="/db.js?qa=1"></script><script>
+document.getElementById('run').onclick=async()=>{
+ const out=document.getElementById('result'),C=TimeCore,D=TimeDB,name='time-tracker-qa-'+crypto.randomUUID(),results=[];out.textContent='运行中…';
+ function ok(v,msg){if(!v)throw new Error(msg);results.push('PASS '+msg);out.textContent=results.join('\n');}
+ try{
+  await D.open(name);let s=await D.snapshot();const a='2026-10-09T01:00:00.000Z',b='2026-10-09T02:00:00.000Z',c='2026-10-09T03:00:00.000Z';
+  await D.enqueue({type:'switch',at:a,event_id:crypto.randomUUID(),event_key:'math'});await D.enqueue({type:'switch',at:b,event_id:crypto.randomUUID(),event_key:'english'});s=await D.snapshot();ok(s.ops.length===2&&s.events.length===1&&s.local.current.event_key==='english','离线切换：当前活动、原始记录与队列原子保存');
+  await D.open(name);s=await D.snapshot();ok(s.local.current.start_at===b&&s.ops.length===2,'重新连接 IndexedDB：活动开始时间与队列恢复');
+  const before=JSON.stringify(s);let rejected=false;try{await D.enqueue({type:'stop',at:'2026-10-08T00:00:00Z'});}catch{rejected=true;}ok(rejected&&JSON.stringify(await D.snapshot())===before,'无效时间事务回滚：不删除活动、不新增队列');
+  await Promise.all([D.enqueue({type:'switch',at:c,event_id:crypto.randomUUID(),event_key:'cs408'}),D.enqueue({type:'stop',at:'2026-10-09T04:00:00.000Z'})]);s=await D.snapshot();ok(s.ops.length===4&&s.local.revision===4&&s.local.current===null,'并发点击：IndexedDB 事务串行化，版本连续');
+  const localBackup={schema_version:1,kind:'local-recovery',...C.clone(s)};
+  let server={revision:0,current:null,config:C.clone(C.DEFAULT_CONFIG),last_operation_id:null};const events=new Map(),days=new Map(),years=new Map(),receipt=new Map();
+  const repo={getEvent:(year,id)=>events.get(id)||null,getDay:d=>days.get(d)||null,getAnnual:y=>years.get(y)||null};
+  const commit=op=>{if(receipt.has(op.op_id))return C.clone(receipt.get(op.op_id));const p=C.planOperation(op,server,repo,Date.now());p.writes.forEach(w=>events.set(w.event.event_id,C.clone(w.event)));p.days.forEach(d=>days.set(d.date,C.clone(d)));p.years.forEach(y=>years.set(y.date,C.clone(y)));server=C.clone(p.state);receipt.set(op.op_id,C.clone(server));return C.clone(server);};
+  // First request reached server but its reply was lost: local queue must remain unchanged.
+  commit(s.ops[0].op);ok((await D.snapshot()).ops.length===4,'回执丢失：待同步队列保持原 UUID');
+  for(const item of s.ops){const reply=commit(item.op);await D.accept(item.op_id,reply);}s=await D.snapshot();ok(s.ops.length===0&&events.size===3&&years.get('2026').total_seconds===10800,'网络恢复与重复同步：逐条确认，原始记录和统计不重复');
+  const savedCloud=C.clone(server);await D.enqueue({type:'switch',at:'2026-10-09T05:00:00.000Z',event_id:crypto.randomUUID(),event_key:'math'});await D.freeze({...savedCloud,revision:100});s=await D.snapshot();ok(s.conflict&&s.ops.length===1,'多设备冲突：冻结并保留本地队列');
+  await D.useCloud();s=await D.snapshot();ok(s.ops.length===0&&s.local.revision===100&&(await D.all('conflicts')).length===1,'冲突处理：本机分支保存为可导出副本');
+  await D.restoreLocal(localBackup);s=await D.snapshot();ok(s.ops.length===4&&s.local.revision===4&&s.ops[0].op_id===localBackup.ops[0].op_id,'本地副本恢复：原 UUID 和待同步队列保持完整');
+  out.textContent=results.join('\n')+'\n\n全部 '+results.length+' 项通过。';
+ }catch(err){out.textContent=results.join('\n')+'\nFAIL '+err.message;}
+};
+</script></html>
+
