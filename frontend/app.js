@@ -2,6 +2,7 @@
 'use strict';
 const $=id=>document.getElementById(id),C=TimeCore,D=TimeDB,T=TimeTransport;
 let snap,settings={},view='day',historyMode='month',historyValue='',subject='',busy=false,editEvent=null,splitEvent=null,verified=null,recordOffset=0,draftConfig,installPrompt;
+let googleIdentityInitialized=false;
 let serial=Promise.resolve(),syncTimer,retryMs=5000,flash='',flashUntil=0;
 function el(tag,text,className){const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(className)n.className=className;return n;}
 function notify(msg){flash=msg;flashUntil=Date.now()+7000;paintStatus();}
@@ -31,12 +32,51 @@ async function sync(){
 }
 function googleLogin(){
   if(!configured())return;
-  const init=()=>{google.accounts.id.initialize({client_id:settings.clientId,callback:async response=>{T.credential(response.credential);notify('登录成功');await sync();},auto_select:false,
-  nonce:crypto.randomUUID(),
-  use_fedcm_for_button:true});$('google-signin').replaceChildren();google.accounts.id.renderButton($('google-signin'),{theme:'outline',size:'large',text:'signin_with',locale:'zh_CN'});};
+
+  const init=()=>{
+    if(!googleIdentityInitialized){
+      google.accounts.id.initialize({
+        client_id:settings.clientId,
+        callback:response=>{
+          T.credential(response.credential);
+          notify('登录成功');
+          sync().catch(failed);
+        },
+        auto_select:false,
+        use_fedcm_for_button:true,
+        nonce:crypto.randomUUID()
+      });
+
+      googleIdentityInitialized=true;
+    }
+
+    $('google-signin').replaceChildren();
+    google.accounts.id.renderButton(
+      $('google-signin'),
+      {
+        theme:'outline',
+        size:'large',
+        text:'signin_with',
+        locale:'zh_CN'
+      }
+    );
+  };
+
   if(globalThis.google?.accounts?.id)return init();
+
   if(document.querySelector('script[data-google-identity]'))return;
-  const script=el('script');script.src='https://accounts.google.com/gsi/client';script.async=true;script.dataset.googleIdentity='true';script.onload=init;script.onerror=()=>{script.remove();notify('Google 登录无法加载；联网后打开设置重试');};document.head.append(script);
+
+  const script=el('script');
+  script.src='https://accounts.google.com/gsi/client';
+  script.async=true;
+  script.dataset.googleIdentity='true';
+  script.onload=init;
+  script.onerror=()=>{
+    script.remove();
+    notify('Google 登录无法加载；联网后打开设置重试');
+  };
+
+  document.head.append(script);
 }
 function selectors(){const box=$('selectors');box.replaceChildren();let mode=view,value='';
   if(view==='history'){const select=el('select');for(const [v,n]of [['day','日期'],['week','周（周一开始）'],['month','月份'],['year','年份'],['all','全部时间']]){const o=el('option',n);o.value=v;select.append(o);}select.value=historyMode;select.onchange=()=>{historyMode=select.value;historyValue='';selectors();renderStats();};box.append(select);mode=historyMode;}
