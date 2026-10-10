@@ -31,7 +31,9 @@ async function sync(){
 }
 function googleLogin(){
   if(!configured())return;
-  const init=()=>{google.accounts.id.initialize({client_id:settings.clientId,callback:async response=>{T.credential(response.credential);notify('登录成功');await sync();},auto_select:false,nonce:crypto.randomUUID()});$('google-signin').replaceChildren();google.accounts.id.renderButton($('google-signin'),{theme:'outline',size:'large',text:'signin_with',locale:'zh_CN'});};
+  const init=()=>{google.accounts.id.initialize({client_id:settings.clientId,callback:async response=>{T.credential(response.credential);notify('登录成功');await sync();},auto_select:false,
+  nonce:crypto.randomUUID(),
+  use_fedcm_for_button:true});$('google-signin').replaceChildren();google.accounts.id.renderButton($('google-signin'),{theme:'outline',size:'large',text:'signin_with',locale:'zh_CN'});};
   if(globalThis.google?.accounts?.id)return init();
   if(document.querySelector('script[data-google-identity]'))return;
   const script=el('script');script.src='https://accounts.google.com/gsi/client';script.async=true;script.dataset.googleIdentity='true';script.onload=init;script.onerror=()=>{script.remove();notify('Google 登录无法加载；联网后打开设置重试');};document.head.append(script);
