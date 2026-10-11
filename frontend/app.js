@@ -6,12 +6,13 @@ let cloudSerial=Promise.resolve(),cloudRetryAt=0;
 let serial=Promise.resolve(),syncTimer,statsTimer,retryMs=5000,flash='',flashUntil=0,syncFlight=null;
 let uiGeneration=0,paintRequest=0,localStatsTimer;
 const toast=TimeUX.toast($('toast'));
-const identity=TimeUX.identity({getId:()=>google.accounts.id,transport:T,onCredential:()=>{notify('Google 登录成功');scheduleSync(100);},onFallback:()=>notify('登录已过期或未完成，请在设置中使用 Google 登录按钮','error')});
+const identity=TimeUX.identity({getId:()=>google.accounts.id,transport:T,onCredential:()=>{notify('Google 登录成功');scheduleSync(100);},onFallback:()=>{$('settings').hidden=false;notify('Google 需要你确认身份，请在设置中点击 Google 登录按钮；记录已保存在本机','error');}});
 function el(tag,text,className){const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(className)n.className=className;return n;}
 function notify(msg,kind='success',key='notice'){flash=msg;flashUntil=Date.now()+7000;paintStatus();toast.show(msg,kind,key);}
 function failed(err){notify(String(err.message||err),'error');console.error(err);}
 function download(name,text,type='application/json'){const url=URL.createObjectURL(new Blob([text],{type})),a=el('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
-function paintStatus(){if(!snap)return;const count=snap.queueCount;let text=snap.conflict?'设备冲突 · 原队列已保留':!navigator.onLine?`离线 · ${count} 个操作待同步`:busy?`正在同步 · ${count} 个操作`:count?`${count} 个操作已保存到本机 · ${T.ready()?'等待同步':'请登录同步'}`:`${snap.cloud?'云端已确认':'本机已就绪'} · ${T.ready()?'已登录':'登录后自动同步'}`;if(flash&&Date.now()<flashUntil)text=flash+' · '+text;$('status').textContent=text;}
+function paintStatus(){if(!snap)return;const count=snap.queueCount;let text=snap.conflict?'设备冲突 · 原队列已保留':!navigator.onLine?`离线 · 联网后自动同步 · ${count} 个操作保存在本机`:busy?`已保存到本机 · 正在自动同步 · ${count} 个操作`:count?`已保存到本机 · ${!configured()?'请先配置云端连接':identity.needsInteraction()?'请确认 Google 身份后自动同步':!T.ready()?'正在尝试自动登录':Date.now()<cloudRetryAt?'云端暂忙，稍后自动重试':'正在自动同步'} · ${count} 个操作`:(snap.cloud?'云端已确认':'本机已就绪 · 登录后自动同步');if(flash&&Date.now()<flashUntil)text=flash+' · '+text;$('status').textContent=text;}
+
 function tick(){if(!snap)return;const cur=snap.local.current;$('elapsed').textContent=cur?(()=>{const s=Math.max(0,Math.floor((Date.now()-C.time(cur.start_at))/1000));return [Math.floor(s/3600),Math.floor(s%3600/60),s%60].map(v=>String(v).padStart(2,'0')).join(':');})():'00:00:00';paintStatus();}
 function paintCurrent(state,{allowReset=false}={}){
   if(snap&&!allowReset&&state.revision<snap.local.revision)return false;
@@ -58,10 +59,10 @@ function send(payload){const flight=cloudSerial.then(()=>sendOne(payload));cloud
 async function sendOne(payload){
   if(Date.now()<cloudRetryAt)throw Object.assign(new Error('云端暂忙，稍后自动重试'),{code:'BUSY'});
   if(!configured())throw new Error('请先保存后端网址和 Google Client ID');
-  let r;try{r=await T.call(settings,payload);}catch(err){if(err.code==='AUTH_REQUIRED'||err.message==='AUTH_REQUIRED'){identity.expired();googleLogin();throw Object.assign(new Error('登录已过期，请使用 Google 登录按钮重试'),{code:'AUTH_REQUIRED'});}if(err.code==='NETWORK_TIMEOUT'||/网络请求超时/.test(err.message)){cloudPause(60000);err.code='NETWORK_TIMEOUT';}throw err;}
+  let r;try{r=await T.call(settings,payload);}catch(err){if(err.code==='AUTH_REQUIRED'||err.message==='AUTH_REQUIRED'){identity.expired();googleLogin();throw Object.assign(new Error('登录已过期，正在尝试自动重新登录'),{code:'AUTH_REQUIRED'});}if(err.code==='NETWORK_TIMEOUT'||/网络请求超时/.test(err.message)){cloudPause(60000);err.code='NETWORK_TIMEOUT';}throw err;}
   if(!r.ok){
     if(r.code==='BUSY'||/Lock timeout/i.test(r.message||'')){cloudPause(Math.max(15000,Math.min(300000,Number(r.retry_after_ms)||15000)));throw Object.assign(new Error('云端暂忙，记录已保存在本机，稍后自动重试。'),{code:'BUSY'});}
-    if(r.code==='AUTH_REQUIRED'){identity.expired();googleLogin();throw new Error('登录已过期，请使用 Google 登录按钮重试');}
+    if(r.code==='AUTH_REQUIRED'){identity.expired();googleLogin();throw Object.assign(new Error('登录已过期，正在尝试自动重新登录'),{code:'AUTH_REQUIRED'});}
     if(payload.action==='sync_batch'&&Array.isArray(r.confirmed)){if(r.code==='YIELD')cloudPause(3000);return r;}
     if(r.code==='CONFLICT'){await D.freeze(r.state);await repaint();throw new Error('设备冲突，队列已保留，请处理后继续');}
     throw new Error(r.message||'服务端暂时未确认');
@@ -72,18 +73,18 @@ async function sync(){
   if(syncFlight)return syncFlight;
   if(!navigator.onLine||!configured())return;
   if(Date.now()<cloudRetryAt){scheduleSync(cloudRetryAt-Date.now());return;}
-  if(!T.ready()){googleLogin();return;}
+  if(!T.ready()){googleLogin();if(!identity.needsInteraction())scheduleSync(Math.max(60000,retryMs));return;}
   const run=async()=>{busy=true;clearTimeout(statsTimer);paintStatus();try{
     let s=await D.getSyncState();if(s.conflict)return;
     const types=new Set(s.ops.map(i=>i.op.type));notify('正在同步…','loading','sync');
     if(!s.ops.length){const r=await send({action:'state'});await D.remote(r.state);}
     else while(s.ops.length){const batch=TimeUX.batch(s.ops);notify('正在同步 '+s.ops.length+' 条记录','loading','sync');const r=await send({action:'sync_batch',ops:batch.map(i=>i.op)});await TimeUX.acceptResponse(D,batch,r);s=await D.getSyncState();if(s.conflict)throw new Error('设备冲突');}
     retryMs=5000;await refreshCurrent();announce();toast.clear('sync');notify(types.size===1?({delete:'删除已同步到云端',edit:'修改已同步',split:'拆分已同步'})[[...types][0]]||'同步完成':'同步完成');deferLocalStats();deferStats();
-  }catch(err){retryMs=Math.min(300000,retryMs*2);await refreshCurrent();notify(['BUSY','YIELD'].includes(err.code)?'云端暂忙，记录已保存在本机，稍后自动重试。':'云端未确认，操作仍安全保存在本机；记录已保存在本机。'+err.message,['BUSY','YIELD'].includes(err.code)?'success':'error');}finally{busy=false;toast.clear('sync');paintStatus();if(await D.getQueueCount()&&!snap.conflict&&T.ready()&&navigator.onLine)scheduleSync();}};
+  }catch(err){retryMs=Math.min(300000,retryMs*2);await refreshCurrent();notify(['BUSY','YIELD'].includes(err.code)?'云端暂忙，记录已保存在本机，稍后自动重试。':'云端未确认，操作仍安全保存在本机；记录已保存在本机。'+err.message,['BUSY','YIELD'].includes(err.code)?'success':'error');}finally{busy=false;toast.clear('sync');paintStatus();if(await D.getQueueCount()&&!snap.conflict&&navigator.onLine){if(T.ready())scheduleSync();else if(!identity.needsInteraction())scheduleSync(Math.max(60000,retryMs));}}};
   syncFlight=(navigator.locks?navigator.locks.request('time-tracker-sync',{ifAvailable:true},lock=>lock?run():scheduleSync(5000)):run()).finally(()=>{syncFlight=null;});return syncFlight;
 }
 function googleLogin(){
-  if(!configured())return;
+  if(!configured()||!navigator.onLine)return;
 
   const init=()=>{
     identity.start(settings.clientId,$('google-signin'));
@@ -100,7 +101,7 @@ function googleLogin(){
   script.onload=init;
   script.onerror=()=>{
     script.remove();
-    notify('Google 登录无法加载；联网后打开设置重试');
+    notify('Google 登录暂时无法加载，记录已保存在本机，将自动重试','error');
   };
 
   document.head.append(script);
@@ -276,7 +277,7 @@ async function restore(){
 }
 async function init(){
   await D.open();settings=await D.get('cache','settings')||{};await repaint();$('backend-url').value=settings.backendUrl||'';$('client-id').value=settings.clientId||'';$('record-year').value=C.dateKey(Date.now(),snap.local.config.timezone).slice(0,4);selectors();renderConfig();await renderStats(false,false,true);
-  if(!configured())$('settings').hidden=false;googleLogin();if(!navigator.onLine)notify('离线状态：记录已保存在本机','error');
+  if(!configured())$('settings').hidden=false;googleLogin();scheduleSync(200);if(!navigator.onLine)notify('离线状态：记录已保存在本机','error');
   if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js').catch(err=>notify('离线页面缓存未就绪：'+err.message));
   if(navigator.storage?.estimate){const estimate=await navigator.storage.estimate();$('storage-info').textContent=`本机已用约 ${Math.ceil((estimate.usage||0)/1024/1024)} MB。浏览器持久存储：${await navigator.storage.persisted()?'已获准':'未获准'}`;}
   setInterval(tick,1000);setInterval(()=>renderStats(),60000);
@@ -286,7 +287,7 @@ $('add-manual').onclick=openManual;$('cancel-manual').onclick=()=>$('manual').cl
 $('stop').onclick=()=>act({type:'stop',at:new Date().toISOString()});
 $('settings-toggle').onclick=()=>{$('settings').hidden=!$('settings').hidden;if(!$('settings').hidden){renderConfig();googleLogin();$('settings').scrollIntoView({behavior:'smooth'});}};
 $('save-settings').onclick=async()=>{try{const proposed={backendUrl:$('backend-url').value.trim(),clientId:$('client-id').value.trim()},old=settings;settings=proposed;if(!configured()){settings=old;throw new Error('网址必须以 /exec 结尾，Client ID 必须是 Google 网页应用 ID');}await D.cache('settings',settings);T.credential('');googleLogin();notify('连接已保存，请登录');}catch(err){failed(err);}};
-$('sync').onclick=()=>{if(!T.ready()){$('settings').hidden=false;googleLogin();notify('正在尝试自动登录，也可使用 Google 登录按钮');}else sync().catch(failed);};
+$('sync').onclick=()=>{scheduleSync(0);notify('已安排重试，将遵守现有同步退避时间');};
 $('persist').onclick=async()=>{try{notify(navigator.storage?.persist&&await navigator.storage.persist()?'浏览器已允许持久存储':'浏览器尚未允许；经常使用并安装 App 后可再试');}catch(err){failed(err);}};
 $('export-local').onclick=()=>exportLocal().catch(failed);$('export-conflict').onclick=$('export-local').onclick;
 $('use-cloud').onclick=async()=>{if(!confirm('采用云端状态并将本机未同步记录保存为冲突副本？建议先导出。'))return;try{await D.useCloud();await repaint({allowReset:true});renderConfig();renderStats(true);announce();notify('已采用云端状态；冲突副本可从本地导出文件找回');}catch(err){failed(err);}};

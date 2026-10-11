@@ -10,12 +10,24 @@
     };
   }
   function identity({getId,transport,onCredential,onFallback,now=()=>Date.now()}){
-    let client='',lastPrompt=-Infinity;
-    return {start(clientId,node){const id=getId();if(client!==clientId){id.cancel?.();client=clientId;lastPrompt=-Infinity;id.initialize({client_id:clientId,auto_select:true,use_fedcm_for_button:true,button_auto_select:true,nonce:crypto.randomUUID(),callback:r=>{transport.credential(r.credential);if(transport.ready())onCredential();else onFallback();}});}
-      node.replaceChildren();id.renderButton(node,{theme:'outline',size:'large',text:'signin_with',locale:'zh_CN'});
-      if(!transport.ready()&&now()-lastPrompt>=60000){lastPrompt=now();try{id.prompt();}catch{onFallback();}}
-    },expired(){transport.credential('');onFallback();}};
+    let client='',lastPrompt=-Infinity,interaction=false,buttonNode=null;
+    function fallback(){
+      if(transport.ready()||interaction)return;
+      interaction=true;
+      if(buttonNode){buttonNode.hidden=false;buttonNode.replaceChildren();getId().renderButton(buttonNode,{theme:'outline',size:'large',text:'signin_with',locale:'zh_CN'});}
+      onFallback();
+    }
+    return {start(clientId,node){const id=getId();buttonNode=node;
+      if(client!==clientId){id.cancel?.();client=clientId;lastPrompt=-Infinity;interaction=false;id.initialize({client_id:clientId,auto_select:true,use_fedcm_for_prompt:true,use_fedcm_for_button:true,button_auto_select:true,nonce:crypto.randomUUID(),callback:r=>{transport.credential(r.credential);if(transport.ready()){interaction=false;node.hidden=true;onCredential();}else fallback();}});}
+      node.hidden=!interaction;
+      if(!transport.ready()&&!interaction&&now()-lastPrompt>=60000){lastPrompt=now();try{id.prompt(n=>{
+        // FedCM has no display-moment notification. Only a concluded/skipped prompt
+        // exposes the manual fallback; credential delivery/cancel() are not failures.
+        if(n.isSkippedMoment?.()||n.isDismissedMoment?.()&&n.getDismissedReason?.()==='flow_restarted')fallback();
+      });}catch{/* A transient SDK failure is retried by scheduleSync, not treated as user consent. */}}
+    },expired(){transport.credential('');},needsInteraction(){return interaction;}};
   }
+
   // A response may confirm only a prefix. Validate before deleting ANY local operation.
   async function acceptResponse(db,batch,r){
     const ids=r.confirmed;

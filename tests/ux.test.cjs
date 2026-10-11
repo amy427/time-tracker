@@ -3,17 +3,17 @@ const {IDBFactory,IDBKeyRange}=require('fake-indexeddb'),C=require('../frontend/
 const clone=v=>JSON.parse(JSON.stringify(v));
 function timers(){let now=0,next=0;const jobs=new Map();return {jobs,setTimeout(fn,ms){const id=++next;jobs.set(id,{fn,at:now+ms});return id;},clearTimeout(id){jobs.delete(id);},advance(ms){now+=ms;for(const [id,j]of [...jobs])if(j.at<=now){jobs.delete(id);j.fn();}},now:()=>now};}
 class Node{constructor(tag='div'){this.tagName=tag;this.children=[];this.dataset={};this.style={};this.hidden=false;this.value='';this.textContent='';this.attrs={};}append(...v){for(const n of v)n.parent=this;this.children.push(...v);}prepend(...v){for(const n of v)n.parent=this;this.children.unshift(...v);}replaceChildren(...v){this.children=[];this.append(...v);}remove(){if(this.parent)this.parent.children=this.parent.children.filter(n=>n!==this);}replaceWith(n){const p=this.parent;if(p){n.parent=p;p.children[p.children.indexOf(this)]=n;}}get lastElementChild(){return this.children.at(-1);}setAttribute(k,v){this.attrs[k]=v;}addEventListener(){}scrollIntoView(){}showModal(){this.open=true;}close(){this.open=false;}}
-function runtime(app=false,debug=false){const clock=timers(),nodes=new Map(),detail=Object.assign(new Node(),{open:true}),g=vm.createContext({console,crypto,structuredClone,Map,Set,Date,Intl,TimeCore:C,IDBKeyRange,indexedDB:new IDBFactory(),atob:s=>Buffer.from(s,'base64').toString(),setTimeout:clock.setTimeout,clearTimeout:clock.clearTimeout,setInterval(){},addEventListener(){},navigator:{onLine:true},location:{origin:'https://owner.github.io',search:debug?'?debug=1':''},document:{getElementById:id=>{if(!nodes.has(id))nodes.set(id,new Node());return nodes.get(id);},createElement:t=>new Node(t),querySelector:s=>s==='.history-records'?detail:null,querySelectorAll:()=>[],addEventListener(){},head:new Node(),body:new Node()}});
+function runtime(app=false,debug=false){const windowEvents=new Map(),documentEvents=new Map(),listen=(map,type,fn)=>{if(!map.has(type))map.set(type,[]);map.get(type).push(fn);};const clock=timers(),nodes=new Map(),detail=Object.assign(new Node(),{open:true}),g=vm.createContext({console,crypto,structuredClone,Map,Set,Date,Intl,TimeCore:C,IDBKeyRange,indexedDB:new IDBFactory(),atob:s=>Buffer.from(s,'base64').toString(),setTimeout:clock.setTimeout,clearTimeout:clock.clearTimeout,setInterval(){},addEventListener:(type,fn)=>listen(windowEvents,type,fn),navigator:{onLine:true},location:{origin:'https://owner.github.io',search:debug?'?debug=1':''},document:{getElementById:id=>{if(!nodes.has(id))nodes.set(id,new Node());return nodes.get(id);},createElement:t=>new Node(t),querySelector:s=>s==='.history-records'?detail:null,querySelectorAll:()=>[],addEventListener:(type,fn)=>listen(documentEvents,type,fn),head:new Node(),body:new Node()}});
   for(const f of ['db.js','ux.js','transport.js'])vm.runInContext(fs.readFileSync('frontend/'+f,'utf8'),g,{filename:f});
   if(app){let source=fs.readFileSync('frontend/app.js','utf8');source=source.slice(0,source.lastIndexOf('init().catch'));g.TimeTransport.ready=()=>true;g.google={accounts:{id:{initialize(){},renderButton(){},prompt(){}}}};vm.runInContext(source,g,{filename:'app.js'});}
-  return {g,clock,nodes,detail,run:s=>vm.runInContext(s,g)};
+  return {g,clock,nodes,detail,dispatchWindow:type=>(windowEvents.get(type)||[]).forEach(fn=>fn({type})),dispatchDocument:type=>(documentEvents.get(type)||[]).forEach(fn=>fn({type})),run:s=>vm.runInContext(s,g)};
 }
 function event(i=0){const a=new Date(Date.parse('2026-01-02T00:00:00Z')+i*60000).toISOString();return C.validateEvent({event_id:crypto.randomUUID(),start_at:a,end_at:new Date(Date.parse(a)+30000).toISOString(),event_name:'数学',category:'学习',note:'',timezone:'UTC',source:'mobile_pwa',created_at:a,updated_at:a,schema_version:1,event_key:'math',revision:0,deleted:false});}
 async function app(){const r=runtime(true),env=environment(),g=r.g,D=g.TimeDB,calls=[];const database=await D.open();g.TimeTransport.call=async(_,p)=>{calls.push(p);switch(p.action){case 'sync_batch':return clone(env.context.commitBatch_(p.ops));case 'state':return {ok:true,state:clone(env.context.state_())};case 'query':return clone(env.context.query_(p));case 'records':return clone(env.context.records_(p));default:throw Error('unexpected action');}};
   await r.run("settings={backendUrl:'https://script.google.com/macros/s/test/exec',clientId:'test.apps.googleusercontent.com'};repaint()");g.document.getElementById('record-year').value='2026';return {...r,D,env,calls,database};
 }
 test('Toast loading persists; success 1800ms/error 4000ms; old timers cannot dismiss new toast',()=>{const {g,clock}=runtime(),node=new Node(),t=g.TimeUX.toast(node,clock);t.show('sync','loading','sync');clock.advance(10000);assert.equal(node.hidden,false);t.show('saved');clock.advance(2000);assert.equal(node.textContent,'sync');t.clear('sync');assert.equal(node.hidden,true);t.show('success');clock.advance(1799);assert.equal(node.hidden,false);clock.advance(1);assert.equal(node.hidden,true);t.show('old');clock.advance(1000);t.show('failed','error');clock.advance(800);assert.equal(node.textContent,'failed');clock.advance(3199);assert.equal(node.hidden,false);clock.advance(1);assert.equal(node.hidden,true);});
-test('GIS returning-user auto select, expiry re-prompt throttling, manual fallback, memory-only token',()=>{const {g,clock}=runtime();let config,prompts=0,buttons=0,success=0,fallback=0;const id={initialize:c=>config=c,renderButton:()=>buttons++,prompt:()=>prompts++},transport=g.TimeTransport,ui=g.TimeUX.identity({getId:()=>id,transport,onCredential:()=>success++,onFallback:()=>fallback++,now:clock.now});const node=new Node();ui.start('client',node);assert.equal(config.auto_select,true);assert.equal(config.button_auto_select,true);assert.equal(config.use_fedcm_for_button,true);assert.equal(prompts,1);ui.start('client',node);assert.equal(prompts,1);const jwt=exp=>'header.'+Buffer.from(JSON.stringify({exp})).toString('base64url')+'.signature';config.callback({credential:jwt(Date.now()/1000+3600)});assert.equal(success,1);assert.equal(transport.ready(),true);ui.expired();clock.advance(60000);ui.start('client',node);assert.equal(prompts,2);config.callback({credential:jwt(Date.now()/1000-1)});assert.equal(transport.ready(),false);assert.equal(fallback,2);assert.ok(buttons>=3);assert.equal(runtime().g.TimeTransport.ready(),false,'reload loses token');});
+test('GIS returning-user auto select, expiry re-prompt throttling, manual fallback, memory-only token',()=>{const {g,clock}=runtime();let config,prompts=0,buttons=0,success=0,fallback=0;const id={initialize:c=>config=c,renderButton:()=>buttons++,prompt:()=>prompts++},transport=g.TimeTransport,ui=g.TimeUX.identity({getId:()=>id,transport,onCredential:()=>success++,onFallback:()=>fallback++,now:clock.now});const node=new Node();ui.start('client',node);assert.equal(config.auto_select,true);assert.equal(config.button_auto_select,true);assert.equal(config.use_fedcm_for_button,true);assert.equal(prompts,1);ui.start('client',node);assert.equal(prompts,1);const jwt=exp=>'header.'+Buffer.from(JSON.stringify({exp})).toString('base64url')+'.signature';config.callback({credential:jwt(Date.now()/1000+3600)});assert.equal(success,1);assert.equal(transport.ready(),true);ui.expired();clock.advance(60000);ui.start('client',node);assert.equal(prompts,2);config.callback({credential:jwt(Date.now()/1000-1)});assert.equal(transport.ready(),false);assert.equal(fallback,1);assert.equal(buttons,1);assert.equal(runtime().g.TimeTransport.ready(),false,'reload loses token');});
 for(const n of [1,3,10])test(`client sync ${n}: one request, immediate completion before delayed summary`,async()=>{const {D,run,calls,clock,nodes}=await app();for(let i=0;i<n;i++)await D.enqueue({type:'import',events:[event(i)]});await run('sync()');assert.equal((await D.snapshot()).ops.length,0);assert.deepEqual(calls.map(c=>c.action),['sync_batch']);assert.equal(calls[0].ops.length,n);assert.equal(nodes.get('toast').textContent,'同步完成');assert.ok([...clock.jobs.values()].some(j=>j.at===2000));});
 test('middle conflict deletes only confirmed ops; remainder survives reload',async()=>{const {D,run,env}=await app();for(let i=0;i<10;i++)await D.enqueue({type:'import',events:[event(i)]});const original=env.context.commit_;let count=0;env.context.commit_=op=>{if(++count===5)return {ok:false,code:'CONFLICT',state:env.context.state_(),message:'conflict'};return original(op);};await run('sync()');let s=await D.snapshot();assert.equal(s.ops.length,6);assert.equal(s.conflict.state.revision,4);const ids=s.ops.map(o=>o.op_id);await D.open();s=await D.snapshot();assert.deepEqual(s.ops.map(o=>o.op_id),ids);});
 test('lost batch reply leaves durable pending, replay is deduplicated without data loss',async()=>{const {g,D,run,env}=await app();for(let i=0;i<3;i++)await D.enqueue({type:'import',events:[event(i)]});const send=g.TimeTransport.call;g.TimeTransport.call=async(...args)=>{await send(...args);throw Error('network interrupted');};await run('sync()');assert.equal((await D.snapshot()).ops.length,3);assert.equal(env.context.state_().revision,3);await D.open();g.TimeTransport.call=send;await run('sync()');assert.equal((await D.snapshot()).ops.length,0);assert.equal(env.context.state_().revision,3);});
@@ -325,4 +325,54 @@ test('in-flight batch toast shows actual pending count without disabling quick b
   const r=await app();for(let i=0;i<3;i++)await r.D.enqueue({type:'import',events:[event(i)]});let resolve,started;
   const ready=new Promise(r=>started=r),send=r.g.TimeTransport.call;r.g.TimeTransport.call=(...args)=>new Promise(r=>{resolve=()=>r(send(...args));started();});
   const syncing=r.run('sync()');await ready;assert.equal(r.nodes.get('toast').textContent,'正在同步 3 条记录');assert.ok(r.nodes.get('quick').children.every(b=>!b.disabled));resolve();await syncing;
+});
+
+
+test('all local operation types keep auto-sync scheduling including manual entries',async()=>{
+  const r=await app();r.detail.open=false;
+  const check=async code=>{await r.run(code);const job=r.clock.jobs.get(r.run('syncTimer'));assert.ok(job);assert.equal(job.at-r.clock.now(),300);};
+  await check("act({type:'switch',event_key:'math',event_id:crypto.randomUUID(),at:new Date(Date.now()-60000).toISOString()})");
+  await check("act({type:'stop',at:new Date().toISOString()})");
+  r.g.e=(await r.D.snapshot()).events[0];await check("act({type:'edit',year:C.eventYear(e),event_id:e.event_id,patch:{note:'updated'}})");
+  await check("act({type:'split',year:C.eventYear(e),event_id:e.event_id,at:C.iso(C.time(e.start_at)+30000),event_key:'english',new_event_id:crypto.randomUUID()})");
+  await check("act({type:'delete',year:C.eventYear(e),event_id:e.event_id})");await check("act({type:'config',config:snap.local.config})");
+  r.run('openManual()');r.nodes.get('manual-key').value='math';r.nodes.get('manual-start').value='2026-01-02T10:00:00';r.nodes.get('manual-end').value='2026-01-02T11:00:00';await check('saveManual({preventDefault(){}})');
+});
+
+async function fireSyncTimer(r){const job=r.clock.jobs.get(r.run('syncTimer'));assert.ok(job,'automatic sync timer exists');r.clock.jobs.delete(r.run('syncTimer'));await job.fn();}
+test('online and foreground events schedule and execute sync without a manual click',async()=>{
+  const r=await app();r.run('renderStats=async()=>{}');r.g.navigator.onLine=false;await r.D.enqueue({type:'import',events:[event()]});
+  r.g.navigator.onLine=true;r.dispatchWindow('online');assert.equal(r.clock.jobs.get(r.run('syncTimer')).at,200);await fireSyncTimer(r);assert.equal(await r.D.getQueueCount(),0);
+  await r.D.enqueue({type:'import',events:[event(1)]});r.g.document.hidden=true;r.clock.jobs.delete(r.run('syncTimer'));r.dispatchDocument('visibilitychange');assert.ok(!r.clock.jobs.has(r.run('syncTimer')));
+  r.g.document.hidden=false;r.dispatchDocument('visibilitychange');await fireSyncTimer(r);assert.equal(await r.D.getQueueCount(),0);assert.deepEqual(r.calls.map(p=>p.action),['sync_batch','sync_batch']);
+});
+
+test('Google credential callback automatically drains pending queue',async()=>{
+  const r=await app();await r.D.enqueue({type:'import',events:[event()]});let config;r.g.TimeTransport.ready=()=>false;r.g.google.accounts.id.initialize=c=>config=c;
+  r.run('googleLogin()');assert.equal(r.nodes.get('google-signin').hidden,true);r.g.TimeTransport.ready=()=>true;config.callback({credential:'test'});
+  assert.equal(r.clock.jobs.get(r.run('syncTimer')).at,100);await fireSyncTimer(r);assert.equal(await r.D.getQueueCount(),0);
+});
+
+test('failed automatic sync retries with existing exponential backoff then succeeds',async()=>{
+  const r=await app();await r.D.enqueue({type:'import',events:[event()]});const send=r.g.TimeTransport.call;let tries=0;r.g.TimeTransport.call=(...args)=>{if(++tries<3)return Promise.reject(new Error('temporary failure'));return send(...args);};
+  r.run('scheduleSync(300)');await fireSyncTimer(r);assert.equal(r.clock.jobs.get(r.run('syncTimer')).at,10000);assert.equal(await r.D.getQueueCount(),1);
+  await fireSyncTimer(r);assert.equal(r.clock.jobs.get(r.run('syncTimer')).at,20000);await fireSyncTimer(r);assert.equal(await r.D.getQueueCount(),0);assert.equal(r.run('retryMs'),5000);
+});
+
+test('expired credential retries automatically; only skipped Google prompt reveals manual sign-in',async()=>{
+  const r=await app();await r.D.enqueue({type:'import',events:[event()]});r.g.TimeTransport.ready=()=>false;let prompt;r.g.google.accounts.id.prompt=fn=>prompt=fn;
+  r.g.document.getElementById('settings').hidden=true;await r.run('sync()');assert.equal(r.nodes.get('google-signin').hidden,true);assert.equal(r.nodes.get('settings').hidden,true);assert.equal(r.clock.jobs.get(r.run('syncTimer')).at,60000);
+  prompt({isSkippedMoment:()=>true});assert.equal(r.nodes.get('google-signin').hidden,false);assert.equal(r.nodes.get('settings').hidden,false);assert.equal(await r.D.getQueueCount(),1);
+});
+
+
+test('transient Google prompt exception keeps automatic retry and does not demand interaction',async()=>{
+  const r=await app();r.g.TimeTransport.ready=()=>false;r.g.google.accounts.id.prompt=()=>{throw Error('temporarily unavailable');};await r.D.enqueue({type:'import',events:[event()]});
+  await r.run('sync()');assert.equal(r.nodes.get('google-signin').hidden,true);assert.equal(r.run('identity.needsInteraction()'),false);assert.equal(r.clock.jobs.get(r.run('syncTimer')).at,60000);
+});
+
+test('automatic sync status distinguishes local, offline, in-flight and cloud confirmation',async()=>{
+  const r=await app();await r.run("act({type:'switch',event_key:'math',event_id:crypto.randomUUID(),at:new Date().toISOString()})");r.run("flash='';paintStatus()");assert.match(r.nodes.get('status').textContent,/已保存到本机 · 正在自动同步/);
+  r.g.navigator.onLine=false;r.run('paintStatus()');assert.match(r.nodes.get('status').textContent,/离线 · 联网后自动同步/);
+  r.g.navigator.onLine=true;await r.run('sync()');r.run("flash='';paintStatus()");assert.equal(r.nodes.get('status').textContent,'云端已确认');
 });
