@@ -52,7 +52,7 @@ test('A: unresolved sync_batch cannot block math → english → fitness or disa
   for(const [i,key]of ['math','english','fitness'].entries()){r.g.spec=activity(key,at+i*1000);await r.run('act(spec)');}
   const s=await r.D.snapshot();assert.equal(s.local.current.event_key,'fitness');assert.equal(s.ops.length,5);assert.deepEqual(s.ops.slice(2).map(i=>i.op.event_key),['math','english','fitness']);
   assert.equal(r.nodes.get('current-name').textContent,'健身');assert.equal(buttons.find(b=>b.dataset.eventKey==='fitness').className,'active');assert.ok(buttons.every(b=>!b.disabled));assert.deepEqual(r.nodes.get('quick').children,buttons,'buttons must retain identity');
-  assert.match(r.nodes.get('toast').textContent,/正在同步…/);
+  assert.match(r.nodes.get('toast').textContent,/正在同步 2 条记录/);
   hold.release();await flight;assert.equal((await r.D.snapshot()).ops.length,0);assert.equal(r.env.context.state_().current.event_key,'fitness');assert.equal(r.nodes.get('current-name').textContent,'健身');assert.deepEqual(r.calls.filter(p=>p.action==='sync_batch').map(p=>p.ops.length),[2,3]);
 });
 test('B: 100 cached cards, closed history, 30-second network stall: fast path touches no records DOM/cache',{timeout:3000},async()=>{
@@ -265,4 +265,64 @@ test('sync and stats requests share one network flight; expired transport pauses
 test('YIELD confirms only committed prefix and retains rest for later sync',async()=>{
   const r=await app();for(let i=0;i<3;i++)await r.D.enqueue({type:'import',events:[event(i)]});r.g.TimeTransport.call=async(_,p)=>clone(r.env.context.commitBatch_(p.ops,1));await r.run('sync()');assert.equal(await r.D.getQueueCount(),2);assert.equal((await r.D.getSyncState()).cloud.revision,1);assert.equal((await r.D.getLocalState()).revision,3);
   r.run('cloudRetryAt=0');r.g.TimeTransport.call=async(_,p)=>clone(r.env.context.commitBatch_(p.ops));await r.run('sync()');assert.equal(await r.D.getQueueCount(),0);assert.equal(r.env.context.state_().revision,3);
+});
+
+test('soft-budget YIELD acknowledges only prefix while later pending UUIDs survive reload',async()=>{
+  const r=await app();for(let i=0;i<10;i++)await r.D.enqueue({type:'import',events:[event(i)]});const queued=await r.D.getSyncState();r.env.context.commitBatch_(queued.ops.slice(0,5).map(i=>i.op));
+  const g=r.env.context;let now=Date.now();g.Date=class extends Date{static now(){return now;}};const commit=g.commit_;g.commit_=op=>{const result=commit(op);now+=result.duplicate?20:11000;return result;};
+  await r.run('sync()');const pending=await r.D.getSyncState();assert.deepEqual(pending.ops.map(o=>o.op_id),queued.ops.slice(6).map(o=>o.op_id));assert.equal(pending.cloud.revision,6);assert.equal(pending.local.revision,10);
+  await r.D.open();assert.deepEqual((await r.D.getSyncState()).ops.map(o=>o.op_id),queued.ops.slice(6).map(o=>o.op_id));
+});
+
+
+test('manual entry persists offline across year boundary without changing running activity; sync retry deduplicates',async()=>{
+  const r=await app();await r.run("act({type:'switch',event_key:'cs408',event_id:crypto.randomUUID(),at:new Date().toISOString()})");
+  const current=clone((await r.D.getLocalState()).current);r.g.navigator.onLine=false;r.run('openManual()');
+  r.nodes.get('manual-key').value='math';r.nodes.get('manual-start').value='2025-12-31T23:30:00';r.nodes.get('manual-end').value='2026-01-01T00:30:00';r.nodes.get('manual-note').value='补记';
+  await r.run('saveManual({preventDefault(){}})');let s=await r.D.snapshot();
+  assert.deepEqual(clone(s.local.current),current);assert.equal(s.ops.length,2);assert.equal(r.calls.length,0);
+  const event=s.events[0];assert.equal(event.source,'manual');assert.equal(event.event_name,'数学二');assert.equal(event.start_at,'2025-12-31T15:30:00.000Z');assert.equal(event.duration_seconds,3600);assert.equal(C.eventYear(event),'2025');assert.equal(r.nodes.get('manual').open,false);
+  await r.D.open();assert.equal(await r.D.getQueueCount(),2);r.g.navigator.onLine=true;
+  const send=r.g.TimeTransport.call;r.g.TimeTransport.call=async(...args)=>{await send(...args);throw Error('lost response');};await r.run('sync()');assert.equal(await r.D.getQueueCount(),2);
+  r.g.TimeTransport.call=send;await r.run('sync()');assert.equal(await r.D.getQueueCount(),0);assert.equal(r.env.context.query_({mode:'all'}).total.total_seconds,3600);
+});
+
+test('manual entry rejects reversed, equal, invalid and future times without enqueue',async()=>{
+  const r=await app();r.run('openManual()');r.nodes.get('manual-key').value='english';
+  for(const [a,b]of [['2026-01-02T10:00:00','2026-01-02T09:00:00'],['2026-01-02T10:00:00','2026-01-02T10:00:00'],['','2026-01-02T10:00:00'],['2099-01-01T10:00:00','2099-01-01T11:00:00']]){
+    r.nodes.get('manual-start').value=a;r.nodes.get('manual-end').value=b;await r.run('saveManual({preventDefault(){}})');assert.equal(await r.D.getQueueCount(),0);assert.equal(r.nodes.get('manual').open,true);assert.ok(r.nodes.get('manual-error').textContent);assert.equal(r.nodes.get('save-manual').disabled,false);
+  }
+});
+
+test('manual save double submit enqueues once and immediately updates visible history',async()=>{
+  const r=await app();r.g.navigator.onLine=false;await r.run('loadRecords()');r.run('openManual()');
+  r.nodes.get('manual-key').value='english';r.nodes.get('manual-start').value='2026-01-02T10:00:00';r.nodes.get('manual-end').value='2026-01-02T11:00:00';
+  await Promise.all([r.run('saveManual({preventDefault(){}})'),r.run('saveManual({preventDefault(){}})')]);
+  assert.equal(await r.D.getQueueCount(),1);assert.equal(r.nodes.get('records').children.length,1);assert.match(r.nodes.get('records').children[0].children[0].textContent,/英语/);assert.equal(r.calls.length,0);
+});
+
+
+test('manual defaults to an available activity when the running activity was removed from config',async()=>{
+  const r=await app();await r.run("act({type:'switch',event_key:'cs408',event_id:crypto.randomUUID(),at:new Date().toISOString()})");
+  await r.run("act({type:'config',config:{...snap.local.config,events:snap.local.config.events.filter(d=>d.id!=='cs408')}})");r.run('openManual()');
+  assert.equal(r.nodes.get('manual-key').value,'math');assert.equal((await r.D.getCurrent()).event_key,'cs408');
+});
+
+test('manual duration preview uses configured timezone and DST without dialogs or database reads',async()=>{
+  const r=await app();await r.run("act({type:'config',config:{...snap.local.config,timezone:'America/New_York'}})");r.run('openManual()');
+  r.nodes.get('manual-start').value='2026-03-08T01:30:00';r.nodes.get('manual-end').value='2026-03-08T03:30:00';r.run('previewManual()');assert.equal(r.nodes.get('manual-duration').textContent,'本次补记时长：1 小时 0 分 0 秒');
+  r.nodes.get('manual-start').value='2026-11-01T01:30:00';r.nodes.get('manual-end').value='2026-11-01T02:30:00';r.g.prompt=()=>{throw Error('preview must not prompt');};r.run('previewManual()');assert.match(r.nodes.get('manual-duration').textContent,/夏令时回拨/);
+  r.nodes.get('manual-start').value='2026-01-01T10:00:00';r.nodes.get('manual-end').value='';r.run('previewManual()');assert.match(r.nodes.get('manual-duration').textContent,/时间格式/);
+});
+
+test('credential expiry in queued transport triggers re-login while preserving pending UUIDs',async()=>{
+  const r=await app();await r.D.enqueue({type:'import',events:[event()]});const before=await r.D.getSyncState();let prompts=0;
+  r.g.google.accounts.id.prompt=()=>prompts++;r.g.TimeTransport.call=async()=>{r.g.TimeTransport.ready=()=>false;throw Object.assign(new Error('AUTH_REQUIRED'),{code:'AUTH_REQUIRED'});};
+  await r.run('sync()');assert.equal(prompts,1);assert.deepEqual(clone((await r.D.getSyncState()).ops),clone(before.ops));assert.match(r.nodes.get('toast').textContent,/登录已过期/);
+});
+
+test('in-flight batch toast shows actual pending count without disabling quick buttons',async()=>{
+  const r=await app();for(let i=0;i<3;i++)await r.D.enqueue({type:'import',events:[event(i)]});let resolve,started;
+  const ready=new Promise(r=>started=r),send=r.g.TimeTransport.call;r.g.TimeTransport.call=(...args)=>new Promise(r=>{resolve=()=>r(send(...args));started();});
+  const syncing=r.run('sync()');await ready;assert.equal(r.nodes.get('toast').textContent,'正在同步 3 条记录');assert.ok(r.nodes.get('quick').children.every(b=>!b.disabled));resolve();await syncing;
 });

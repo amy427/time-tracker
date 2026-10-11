@@ -1,0 +1,220 @@
+{
+  "model": "Fixed per-service costs plus identical 3s/13s storage stalls; synthetic, not production measurements",
+  "baseline_ref": "2bc2ad8dc786530befa235e072e21784dbd08dd7",
+  "before": {
+    "requests": [
+      {
+        "total_ms": 42915,
+        "lock_ms": 42760,
+        "elapsed_ms": 42915,
+        "confirmed": 7,
+        "code": "YIELD",
+        "text_finders": 46,
+        "commits": [
+          {
+            "index": 0,
+            "total_ms": 790,
+            "lookup_op_ms": 610,
+            "apply_plan_ms": 0
+          },
+          {
+            "index": 1,
+            "total_ms": 540,
+            "lookup_op_ms": 360,
+            "apply_plan_ms": 0
+          },
+          {
+            "index": 2,
+            "total_ms": 540,
+            "lookup_op_ms": 360,
+            "apply_plan_ms": 0
+          },
+          {
+            "index": 3,
+            "total_ms": 540,
+            "lookup_op_ms": 360,
+            "apply_plan_ms": 0
+          },
+          {
+            "index": 4,
+            "total_ms": 540,
+            "lookup_op_ms": 360,
+            "apply_plan_ms": 0
+          },
+          {
+            "index": 5,
+            "total_ms": 15150,
+            "lookup_op_ms": 270,
+            "apply_plan_ms": 10700
+          },
+          {
+            "index": 6,
+            "total_ms": 24320,
+            "lookup_op_ms": 270,
+            "apply_plan_ms": 20700
+          }
+        ]
+      },
+      {
+        "total_ms": 30215,
+        "lock_ms": 30060,
+        "elapsed_ms": 30215,
+        "confirmed": 2,
+        "code": "YIELD",
+        "text_finders": 41,
+        "commits": [
+          {
+            "index": 0,
+            "total_ms": 15400,
+            "lookup_op_ms": 520,
+            "apply_plan_ms": 10700
+          },
+          {
+            "index": 1,
+            "total_ms": 14320,
+            "lookup_op_ms": 270,
+            "apply_plan_ms": 10700
+          }
+        ]
+      },
+      {
+        "total_ms": 15895,
+        "lock_ms": 15740,
+        "elapsed_ms": 15895,
+        "confirmed": 1,
+        "code": "OK",
+        "text_finders": 21,
+        "commits": [
+          {
+            "index": 0,
+            "total_ms": 15400,
+            "lookup_op_ms": 520,
+            "apply_plan_ms": 10700
+          }
+        ]
+      }
+    ],
+    "all_request_total_ms": 89025,
+    "max_request_ms": 42915,
+    "final_revision": 10,
+    "total_seconds": 300
+  },
+  "after": {
+    "requests": [
+      {
+        "total_ms": 13971,
+        "lock_ms": 13816,
+        "elapsed_ms": 13971,
+        "confirmed": 6,
+        "code": "YIELD",
+        "text_finders": 9,
+        "commits": [
+          {
+            "index": 0,
+            "total_ms": 188,
+            "lookup_op_ms": 8,
+            "apply_plan_ms": 0
+          },
+          {
+            "index": 1,
+            "total_ms": 188,
+            "lookup_op_ms": 8,
+            "apply_plan_ms": 0
+          },
+          {
+            "index": 2,
+            "total_ms": 188,
+            "lookup_op_ms": 8,
+            "apply_plan_ms": 0
+          },
+          {
+            "index": 3,
+            "total_ms": 188,
+            "lookup_op_ms": 8,
+            "apply_plan_ms": 0
+          },
+          {
+            "index": 4,
+            "total_ms": 188,
+            "lookup_op_ms": 8,
+            "apply_plan_ms": 0
+          },
+          {
+            "index": 5,
+            "total_ms": 12536,
+            "lookup_op_ms": 528,
+            "apply_plan_ms": 8308
+          }
+        ]
+      },
+      {
+        "total_ms": 23031,
+        "lock_ms": 22876,
+        "elapsed_ms": 23031,
+        "confirmed": 1,
+        "code": "YIELD",
+        "text_finders": 9,
+        "commits": [
+          {
+            "index": 0,
+            "total_ms": 22536,
+            "lookup_op_ms": 528,
+            "apply_plan_ms": 18308
+          }
+        ]
+      },
+      {
+        "total_ms": 13031,
+        "lock_ms": 12876,
+        "elapsed_ms": 13031,
+        "confirmed": 1,
+        "code": "YIELD",
+        "text_finders": 9,
+        "commits": [
+          {
+            "index": 0,
+            "total_ms": 12536,
+            "lookup_op_ms": 528,
+            "apply_plan_ms": 8308
+          }
+        ]
+      },
+      {
+        "total_ms": 13031,
+        "lock_ms": 12876,
+        "elapsed_ms": 13031,
+        "confirmed": 1,
+        "code": "YIELD",
+        "text_finders": 9,
+        "commits": [
+          {
+            "index": 0,
+            "total_ms": 12536,
+            "lookup_op_ms": 528,
+            "apply_plan_ms": 8308
+          }
+        ]
+      },
+      {
+        "total_ms": 13031,
+        "lock_ms": 12876,
+        "elapsed_ms": 13031,
+        "confirmed": 1,
+        "code": "OK",
+        "text_finders": 9,
+        "commits": [
+          {
+            "index": 0,
+            "total_ms": 12536,
+            "lookup_op_ms": 528,
+            "apply_plan_ms": 8308
+          }
+        ]
+      }
+    ],
+    "all_request_total_ms": 76095,
+    "max_request_ms": 23031,
+    "final_revision": 10,
+    "total_seconds": 300
+  }
+}

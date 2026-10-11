@@ -1,6 +1,6 @@
 function markBackupsDirty_(writes,revision){
   var s=master_().getSheetByName('backup_index'),periods={};writes.forEach(function(w){periods[w.year]=true;periods[TimeCore.dateKey(TimeCore.time(w.event.start_at),w.event.timezone).slice(0,7)]=true;});
-  Object.keys(periods).forEach(function(period){var row=findRow_(s,period),old=row?s.getRange(row,1,1,5).getValues()[0]:[period,'','',0,true];old[4]=true;upsert_(s,period,old);});
+  Object.keys(periods).forEach(function(period){var row=findRow_(s,period),old=row?s.getRange(row,1,1,5).getValues()[0]:[period,'','',0,true];old[4]=true;upsertAt_(s,row,old);});
 }
 function csv_(events){
   function cell(v){var s=String(v==null?'':v);if(/^[=+\-@\t\r]/.test(s))s="'"+s;return '"'+s.replace(/"/g,'""')+'"';}

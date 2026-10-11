@@ -58,7 +58,7 @@ function send(payload){const flight=cloudSerial.then(()=>sendOne(payload));cloud
 async function sendOne(payload){
   if(Date.now()<cloudRetryAt)throw Object.assign(new Error('云端暂忙，稍后自动重试'),{code:'BUSY'});
   if(!configured())throw new Error('请先保存后端网址和 Google Client ID');
-  let r;try{r=await T.call(settings,payload);}catch(err){if(err.code==='NETWORK_TIMEOUT'||/网络请求超时/.test(err.message)){cloudPause(60000);err.code='NETWORK_TIMEOUT';}throw err;}
+  let r;try{r=await T.call(settings,payload);}catch(err){if(err.code==='AUTH_REQUIRED'||err.message==='AUTH_REQUIRED'){identity.expired();googleLogin();throw Object.assign(new Error('登录已过期，请使用 Google 登录按钮重试'),{code:'AUTH_REQUIRED'});}if(err.code==='NETWORK_TIMEOUT'||/网络请求超时/.test(err.message)){cloudPause(60000);err.code='NETWORK_TIMEOUT';}throw err;}
   if(!r.ok){
     if(r.code==='BUSY'||/Lock timeout/i.test(r.message||'')){cloudPause(Math.max(15000,Math.min(300000,Number(r.retry_after_ms)||15000)));throw Object.assign(new Error('云端暂忙，记录已保存在本机，稍后自动重试。'),{code:'BUSY'});}
     if(r.code==='AUTH_REQUIRED'){identity.expired();googleLogin();throw new Error('登录已过期，请使用 Google 登录按钮重试');}
@@ -77,7 +77,7 @@ async function sync(){
     let s=await D.getSyncState();if(s.conflict)return;
     const types=new Set(s.ops.map(i=>i.op.type));notify('正在同步…','loading','sync');
     if(!s.ops.length){const r=await send({action:'state'});await D.remote(r.state);}
-    else while(s.ops.length){const batch=TimeUX.batch(s.ops);const r=await send({action:'sync_batch',ops:batch.map(i=>i.op)});await TimeUX.acceptResponse(D,batch,r);s=await D.getSyncState();if(s.conflict)throw new Error('设备冲突');}
+    else while(s.ops.length){const batch=TimeUX.batch(s.ops);notify('正在同步 '+s.ops.length+' 条记录','loading','sync');const r=await send({action:'sync_batch',ops:batch.map(i=>i.op)});await TimeUX.acceptResponse(D,batch,r);s=await D.getSyncState();if(s.conflict)throw new Error('设备冲突');}
     retryMs=5000;await refreshCurrent();announce();toast.clear('sync');notify(types.size===1?({delete:'删除已同步到云端',edit:'修改已同步',split:'拆分已同步'})[[...types][0]]||'同步完成':'同步完成');deferLocalStats();deferStats();
   }catch(err){retryMs=Math.min(300000,retryMs*2);await refreshCurrent();notify(['BUSY','YIELD'].includes(err.code)?'云端暂忙，记录已保存在本机，稍后自动重试。':'云端未确认，操作仍安全保存在本机；记录已保存在本机。'+err.message,['BUSY','YIELD'].includes(err.code)?'success':'error');}finally{busy=false;toast.clear('sync');paintStatus();if(await D.getQueueCount()&&!snap.conflict&&T.ready()&&navigator.onLine)scheduleSync();}};
   syncFlight=(navigator.locks?navigator.locks.request('time-tracker-sync',{ifAvailable:true},lock=>lock?run():scheduleSync(5000)):run()).finally(()=>{syncFlight=null;});return syncFlight;
@@ -151,13 +151,13 @@ async function renderStats(refresh=false,localOnly=false,allowLocalRecovery=fals
   }catch(err){if(gen===statsGeneration)$('stats-note').textContent='统计暂未刷新：'+err.message;}
 }
 function localInput(iso,tz){const p=C.parts(C.time(iso),tz);return `${p.year}-${String(p.month).padStart(2,'0')}-${String(p.day).padStart(2,'0')}T${String(p.hour).padStart(2,'0')}:${String(p.minute).padStart(2,'0')}:${String(p.second).padStart(2,'0')}`;}
-function inputInstant(value,tz){
+function inputInstant(value,tz,chooseAmbiguous=true){
   const base=Date.parse(value+'Z');if(!Number.isFinite(base))throw new Error('时间格式错误');const offsets=new Set();
   for(let d=-2;d<=2;d++){const ms=base+d*C.DAY,p=C.parts(ms,tz);offsets.add(Date.UTC(p.year,p.month-1,p.day,p.hour,p.minute,p.second)-ms);}
   const normalized=value.length===16?value+':00':value;
   const candidates=[...offsets].map(offset=>C.iso(base-offset)).filter(iso=>localInput(iso,tz)===normalized);
   if(!candidates.length)throw new Error('该本地时间位于夏令时跳过区间，请选择有效时间');
-  if(candidates.length>1){const choice=prompt('夏令时回拨产生两个相同本地时间。请复制选择一个 UTC 时间：\n'+candidates.join('\n'),candidates[0]);if(!candidates.includes(choice))throw new Error('未确认夏令时重叠时间');return choice;}
+  if(candidates.length>1){if(!chooseAmbiguous)throw new Error('该时间处于夏令时回拨区间，保存时需确认具体时间');const choice=prompt('夏令时回拨产生两个相同本地时间。请复制选择一个 UTC 时间：\n'+candidates.join('\n'),candidates[0]);if(!candidates.includes(choice))throw new Error('未确认夏令时重叠时间');return choice;}
   return candidates[0];
 }
 let recordsYear='',recordNext=null,recordsGeneration=0,recordsPaintGeneration=0,recordsReconcileTimer;
@@ -220,6 +220,40 @@ async function loadRecords(direction=false){
   catch(err){if(generation===recordsGeneration)notify('云端未确认，记录已保存在本机。'+err.message,'error');}
   finally{if(generation===recordsGeneration)toast.clear('records');}
 }
+let manualConfig=null,manualSaving=false;
+function openManual(){
+  if(manualSaving)return;
+  manualConfig=C.clone(snap.local.config);
+  $('manual-key').replaceChildren(...manualConfig.events.map(def=>{const o=el('option',def.name);o.value=def.id;return o;}));
+  $('manual-key').value=manualConfig.events.some(d=>d.id===snap.local.current?.event_key)?snap.local.current.event_key:manualConfig.events[0].id;
+  const now=Date.now();$('manual-start').value=localInput(C.iso(now-30*60000),manualConfig.timezone);$('manual-end').value=localInput(C.iso(now),manualConfig.timezone);
+  $('manual-zone').textContent='以上时间使用时区：'+manualConfig.timezone;
+  $('manual-note').value='';$('manual-error').textContent='';previewManual();$('manual').showModal();
+}
+function previewManual(){
+  if(!manualConfig)return;
+  try{
+    const a=inputInstant($('manual-start').value,manualConfig.timezone,false),b=inputInstant($('manual-end').value,manualConfig.timezone,false),seconds=(C.time(b)-C.time(a))/1000;
+    if(seconds<=0)throw new Error('结束时间必须晚于开始时间');
+    if(seconds*1000>C.MAX_SPAN)throw new Error('单条事件最多 366 天');
+    if(C.time(b)>Date.now())throw new Error('补记的结束时间不能晚于现在');
+    $('manual-duration').textContent='本次补记时长：'+Math.floor(seconds/3600)+' 小时 '+Math.floor(seconds%3600/60)+' 分 '+seconds%60+' 秒';
+  }catch(err){$('manual-duration').textContent=err.message;}
+}
+async function saveManual(e){
+  e.preventDefault();if(manualSaving)return;
+  manualSaving=true;$('save-manual').disabled=true;$('manual-error').textContent='';
+  try{
+    const def=manualConfig.events.find(d=>d.id===$('manual-key').value);if(!def)throw new Error('请选择活动');
+    const start=inputInstant($('manual-start').value,manualConfig.timezone),end=inputInstant($('manual-end').value,manualConfig.timezone),now=Date.now();
+    if(C.time(end)<=C.time(start))throw new Error('结束时间必须晚于开始时间');
+    if(C.time(end)>now)throw new Error('补记的结束时间不能晚于现在');
+    const event=C.validateEvent({event_id:crypto.randomUUID(),start_at:start,end_at:end,event_key:def.id,event_name:def.name,category:def.category,note:$('manual-note').value,timezone:manualConfig.timezone,source:'manual',created_at:C.iso(now),updated_at:C.iso(now),schema_version:1,revision:0,deleted:false});
+    await act({type:'import',events:[event]});
+    $('manual').close();notify('补记已保存到本机，联网登录后自动同步');
+  }catch(err){$('manual-error').textContent=err.message;notify(err.message,'error');}
+  finally{manualSaving=false;$('save-manual').disabled=false;}
+}
 function openEditor(event){editEvent=event;$('edit-start').value=localInput(event.start_at,event.timezone);$('edit-end').value=localInput(event.end_at,event.timezone);$('edit-name').value=event.event_name;$('edit-category').value=event.category;$('edit-note').value=event.note;$('edit-zone').textContent=event.timezone+'；开始年份改变会自动迁移归档。';$('editor').showModal();}
 function openSplitter(event){splitEvent=event;$('split-at').value=localInput(C.iso((C.time(event.start_at)+C.time(event.end_at))/2),event.timezone);$('split-key').replaceChildren();for(const def of snap.local.config.events){const o=el('option',def.name);o.value=def.id;$('split-key').append(o);}$('splitter').showModal();}
 function renderConfig(){draftConfig=C.clone(snap.local.config);$('timezone').value=draftConfig.timezone;paintConfig();}
@@ -247,6 +281,8 @@ async function init(){
   if(navigator.storage?.estimate){const estimate=await navigator.storage.estimate();$('storage-info').textContent=`本机已用约 ${Math.ceil((estimate.usage||0)/1024/1024)} MB。浏览器持久存储：${await navigator.storage.persisted()?'已获准':'未获准'}`;}
   setInterval(tick,1000);setInterval(()=>renderStats(),60000);
 }
+$('manual-start').oninput=previewManual;$('manual-end').oninput=previewManual;
+$('add-manual').onclick=openManual;$('cancel-manual').onclick=()=>$('manual').close();$('manual-form').onsubmit=saveManual;
 $('stop').onclick=()=>act({type:'stop',at:new Date().toISOString()});
 $('settings-toggle').onclick=()=>{$('settings').hidden=!$('settings').hidden;if(!$('settings').hidden){renderConfig();googleLogin();$('settings').scrollIntoView({behavior:'smooth'});}};
 $('save-settings').onclick=async()=>{try{const proposed={backendUrl:$('backend-url').value.trim(),clientId:$('client-id').value.trim()},old=settings;settings=proposed;if(!configured()){settings=old;throw new Error('网址必须以 /exec 结尾，Client ID 必须是 Google 网页应用 ID');}await D.cache('settings',settings);T.credential('');googleLogin();notify('连接已保存，请登录');}catch(err){failed(err);}};

@@ -4,7 +4,7 @@
   function ready(){return !!token&&expires>Date.now()+30000;}
   // Form POST avoids CORS preflight; UUID nonce correlates the Google-hosted response.
   function call(settings,payload){return new Promise((resolve,reject)=>{
-    if(!ready())return reject(new Error('AUTH_REQUIRED'));
+    if(!ready())return reject(Object.assign(new Error('AUTH_REQUIRED'),{code:'AUTH_REQUIRED'}));
     const nonce=crypto.randomUUID(),frame=document.createElement('iframe'),form=document.createElement('form');frame.name='tt_'+nonce;frame.hidden=true;frame.title='云端同步';
     form.method='POST';form.action=settings.backendUrl;form.target=frame.name;form.hidden=true;
     const input=document.createElement('input');input.name='payload';input.value=JSON.stringify({...payload,nonce,origin:location.origin,token});form.append(input);

@@ -66,3 +66,48 @@ test('backup captured before a concurrent commit cannot clear dirty flag or repl
   const {context:g}=environment();g.commitBatch_(batch(1));const snapshot=g.captureBackup_('2026'),written=g.writeBackup_(snapshot);g.commitBatch_(batch(1,1));assert.equal(g.publishBackup_(snapshot,written),false);
   const row=g.rows_(g.master_().getSheetByName('backup_index'),5).find(r=>r[0]==='2026');assert.equal(row[4],true);assert.equal(row[1],'');assert.equal(g.state_().revision,2);
 });
+
+test('duplicate receipt cache hit opens no OperationIndex book; altered payload is still rejected',()=>{
+  const env=environment(),g=env.context,request=batch(1)[0];g.commit_(request);const bucket=env.properties.get('OP_BUCKET_'+request.op_id.slice(0,2));g.resetExecution_();env.metrics.opens.length=0;
+  assert.equal(g.commit_(request).duplicate,true);assert.equal(env.metrics.opens.filter(id=>id===bucket).length,0);
+  assert.throws(()=>g.commit_({...request,events:[{...request.events[0],note:'changed'}]}),/UUID/);
+  assert.equal(g.state_().revision,1);assert.equal(g.query_({mode:'all'}).total.total_seconds,30);
+});
+
+test('eviction, malformed cache and CacheService outages all fall back to durable receipts',()=>{
+  for(const mode of ['evicted','malformed','outage']){const env=environment(),g=env.context,request=batch(1)[0];g.commit_(request);const key=g.receiptCacheKey_(request.op_id),bucket=env.properties.get('OP_BUCKET_'+request.op_id.slice(0,2));
+    if(mode==='evicted')env.cache.delete(key);if(mode==='malformed')env.cache.set(key,'not JSON');if(mode==='outage')g.CacheService.getScriptCache=()=>{throw Error('cache offline');};
+    g.resetExecution_();env.metrics.opens.length=0;assert.equal(g.commit_(request).duplicate,true);assert.ok(env.metrics.opens.includes(bucket));assert.equal(g.state_().revision,1);assert.equal(allRecords(g,'2026').length,1);
+  }
+});
+
+test('no receipt cache before successful flush; recovery fills it only after durable receipt',()=>{
+  const env=environment(),g=env.context,request=batch(1)[0],timed=g.perfTimed_;let crash=true,flushed=false;
+  g.perfTimed_=(p,key,fn)=>{if(key==='flush_receipt_ms'&&crash)throw Error('crash before receipt flush');const result=timed(p,key,fn);if(key==='flush_receipt_ms')flushed=true;return result;};
+  const cache=g.cacheReceipt_;g.cacheReceipt_=r=>{assert.equal(flushed,true);cache(r);};assert.throws(()=>g.commit_(request),/receipt flush/);assert.equal(env.cache.has(g.receiptCacheKey_(request.op_id)),false);
+  crash=false;g.resetExecution_();assert.equal(g.commit_(request).duplicate,true);assert.equal(env.cache.has(g.receiptCacheKey_(request.op_id)),true);assert.equal(g.state_().revision,1);assert.equal(allRecords(g,'2026').length,1);
+});
+
+test('soft budget yields after five duplicates plus one 11s commit, before a second 21s commit',()=>{
+  const env=environment(),g=env.context,ops=batch(10);g.commitBatch_(ops.slice(0,5));let now=Date.now(),real=0;g.Date=class extends Date{static now(){return now;}};const commit=g.commit_;
+  g.commit_=o=>{const result=commit(o);now+=result.duplicate?20:(++real===1?11000:21000);return result;};const start=now,r=g.commitBatch_(ops,start+10000);
+  assert.equal(r.code,'YIELD');assert.equal(r.confirmed.length,6);assert.equal(r.failed_index,6);assert.equal(now-start,11100);assert.equal(real,1);
+  let remaining=ops.slice(6);while(remaining.length){const reply=g.commitBatch_(remaining);remaining=remaining.slice(reply.confirmed.length);}
+  assert.equal(g.state_().revision,10);assert.equal(allRecords(g,'2026').length,10);assert.equal(g.query_({mode:'all'}).total.total_seconds,300);
+});
+
+test('lost replies and repeated full replay keep events/summaries/receipts unique with warm and evicted cache',()=>{
+  const env=environment(),g=env.context,ops=batch(3);for(let attempt=0;attempt<4;attempt++){if(attempt%2)env.cache.clear();g.resetExecution_();const r=g.commitBatch_(ops);assert.equal(r.ok,true);assert.equal(r.state.revision,3);}
+  assert.equal(allRecords(g,'2026').length,3);assert.equal(g.query_({mode:'all'}).total.total_seconds,90);assert.equal(g.rows_(g.logSheet_(ops[0].queued_at),5).length,3);
+  for(const o of ops)assert.equal(g.rows_(g.operationIndex_(o.op_id),5).filter(r=>r[0]===o.op_id).length,1);
+});
+
+test('known rows eliminate repeated event/record/backup searches and new receipt searches',()=>{
+  const env=environment(),g=env.context,e=event(),first=op(0,'import',{events:[e]});g.commit_(first);env.metrics.finds.length=0;
+  const edit=op(1,'edit',{year:'2026',event_id:e.event_id,patch:{note:'updated'}});g.commit_(edit);
+  const calls=env.metrics.finds;assert.equal(calls.filter(q=>q.sheet==='events'&&q.key===e.event_id).length,1);
+  assert.equal(calls.filter(q=>q.sheet==='records_index'&&q.key===e.event_id).length,1);
+  for(const period of ['2026','2026-01'])assert.equal(calls.filter(q=>q.sheet==='backup_index'&&q.key===period).length,1);
+  assert.equal(calls.filter(q=>q.sheet.startsWith('operations_')&&q.key===edit.op_id).length,0);
+  assert.ok(calls.filter(q=>q.sheet==='operations'&&q.key===edit.op_id).length<=1);
+});

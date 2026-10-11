@@ -28,28 +28,39 @@ function verifyIdToken_(token,bindOwner){
 }
 function doGet(){return HtmlService.createHtmlOutput('<!doctype html><meta charset="utf-8"><p>时间记录后端已运行。请使用你的 PWA 前端登录。</p>');}
 function doPost(e){
+  var profile=perfBegin_(),lock=null,held=false,acquiredAt=0;
+  function released(){held=false;profile._held=false;profile.lock_ms=Math.max(0,Date.now()-acquiredAt);}
+  function releaseHeld(){if(!held||!lock)return;lock.releaseLock();released();}
+  try{
   resetExecution_();
   var payload,reply,origin=props_().getProperty('ALLOWED_ORIGIN'),nonce='';
   try{
-    TimeCore.assert(e&&e.parameter&&typeof e.parameter.payload==='string'&&e.parameter.payload.length<100000,'请求无效');payload=JSON.parse(e.parameter.payload);nonce=payload.nonce;
+    TimeCore.assert(e&&e.parameter&&typeof e.parameter.payload==='string'&&e.parameter.payload.length<100000,'请求无效');payload=JSON.parse(e.parameter.payload);nonce=payload.nonce;profile.action=['sync','sync_batch','state','query','records'].indexOf(payload.action)>=0?payload.action:'unknown';profile.batch_size=payload.action==='sync_batch'&&Array.isArray(payload.ops)?payload.ops.length:payload.action==='sync'?1:0;
     TimeCore.assert(TimeCore.uuid(nonce)&&payload.origin===origin,'来源无效');
     // Signature/JWKS work must not hold the shared data lock. Recheck owner after
     // acquisition, so simultaneous first logins cannot bind different subjects.
-    var subject=verifyIdToken_(payload.token,false),lock=LockService.getScriptLock();
-    if(!lock.tryLock(1000))throw new Error('CLOUD_BUSY');
-    var acquiredAt=Date.now();
-    try{var owner=props_().getProperty('OWNER_SUB');TimeCore.assert(!owner||owner===subject,'无权访问');if(!owner)props_().setProperty('OWNER_SUB',subject);recover_();
+    var subject=perfTimed_(profile,'auth_ms',function(){return verifyIdToken_(payload.token,false);});lock=LockService.getScriptLock();
+    if(!perfTimed_(profile,'lock_wait_ms',function(){return lock.tryLock(1000);}))throw new Error('CLOUD_BUSY');
+    held=true;profile._held=true;acquiredAt=Date.now();
+    try{var owner=props_().getProperty('OWNER_SUB');TimeCore.assert(!owner||owner===subject,'无权访问');if(!owner)props_().setProperty('OWNER_SUB',subject);perfTimed_(profile,'recover_ms',function(){recover_();});
       if(payload.action==='sync')reply=commit_(payload.op);
-      else if(payload.action==='sync_batch')reply=commitBatch_(payload.ops,acquiredAt+20000);
-      else if(payload.action==='state')reply={ok:true,state:state_()};
-      else if(payload.action==='query')reply=query_(payload);
-      else if(payload.action==='records')reply=records_(payload);
+      else if(payload.action==='sync_batch')reply=commitBatch_(payload.ops,acquiredAt+10000);
+      else if(payload.action==='state')reply=perfTimed_(profile,'state_ms',function(){return {ok:true,state:state_()};});
+      else if(payload.action==='query')reply=perfTimed_(profile,'query_ms',function(){return query_(payload);});
+      else if(payload.action==='records')reply=perfTimed_(profile,'records_ms',function(){return records_(payload);});
       else throw new Error('操作无效');
-    }finally{lock.releaseLock();console.log(JSON.stringify({action:payload.action,lock_ms:Date.now()-acquiredAt}));}
-  }catch(err){var msg=String(err.message||err),busy=msg==='CLOUD_BUSY'||/Lock timeout/i.test(msg);reply={ok:false,code:busy?'BUSY':msg==='AUTH_REQUIRED'?'AUTH_REQUIRED':'ERROR',message:busy?'云端暂忙，记录已保存在本机，稍后自动重试。':msg};if(busy)reply.retry_after_ms=15000;}
+    }finally{releaseHeld();}
+  }catch(err){profile.exception=true;var msg=String(err.message||err),busy=msg==='CLOUD_BUSY'||/Lock timeout/i.test(msg);reply={ok:false,code:busy?'BUSY':msg==='AUTH_REQUIRED'?'AUTH_REQUIRED':'ERROR',message:busy?'云端暂忙，记录已保存在本机，稍后自动重试。':msg};if(busy)reply.retry_after_ms=15000;}
   var result={channel:'time-tracker-v1',nonce:nonce,reply:reply};
   // Escape HTML-breaking chars before placing JSON inside an inline script.
   var encoded=JSON.stringify(result).replace(/</g,'\\u003c').replace(/>/g,'\\u003e').replace(/&/g,'\\u0026').replace(/\u2028/g,'\\u2028').replace(/\u2029/g,'\\u2029');
   var target=JSON.stringify(origin||'https://invalid.example').replace(/</g,'\\u003c');
   return HtmlService.createHtmlOutput('<!doctype html><meta charset="utf-8"><script>var w=window;for(var i=0;i<4&&w.parent!==w;i++)w=w.parent;w.postMessage('+encoded+','+target+');</script>').setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  }catch(err){profile.exception=true;throw err;}finally{
+    // One finalization point for all returns/throws. Retry only an unconfirmed
+    // release; never release twice after a successful release.
+    if(held&&lock){try{if(typeof lock.hasLock==='function'&&!lock.hasLock())released();else releaseHeld();}catch(ignore){}}
+    try{if(!held&&profile._held===false)perfFinish_(profile);}catch(ignore){}
+    finally{if(perfProfile_===profile)perfProfile_=null;}
+  }
 }
