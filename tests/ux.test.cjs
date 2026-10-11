@@ -1,9 +1,9 @@
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm'),crypto=require('node:crypto');
-const {IDBFactory}=require('fake-indexeddb'),C=require('../frontend/core.js'),{environment}=require('./fake-gas.cjs');
+const {IDBFactory,IDBKeyRange}=require('fake-indexeddb'),C=require('../frontend/core.js'),{environment}=require('./fake-gas.cjs');
 const clone=v=>JSON.parse(JSON.stringify(v));
 function timers(){let now=0,next=0;const jobs=new Map();return {jobs,setTimeout(fn,ms){const id=++next;jobs.set(id,{fn,at:now+ms});return id;},clearTimeout(id){jobs.delete(id);},advance(ms){now+=ms;for(const [id,j]of [...jobs])if(j.at<=now){jobs.delete(id);j.fn();}},now:()=>now};}
 class Node{constructor(tag='div'){this.tagName=tag;this.children=[];this.dataset={};this.style={};this.hidden=false;this.value='';this.textContent='';this.attrs={};}append(...v){this.children.push(...v);}prepend(...v){this.children.unshift(...v);}replaceChildren(...v){this.children=[...v];}setAttribute(k,v){this.attrs[k]=v;}addEventListener(){}scrollIntoView(){}showModal(){this.open=true;}close(){this.open=false;}}
-function runtime(app=false){const clock=timers(),nodes=new Map(),detail=Object.assign(new Node(),{open:true}),g=vm.createContext({console,crypto,structuredClone,Map,Set,Date,Intl,TimeCore:C,indexedDB:new IDBFactory(),atob:s=>Buffer.from(s,'base64').toString(),setTimeout:clock.setTimeout,clearTimeout:clock.clearTimeout,setInterval(){},addEventListener(){},navigator:{onLine:true},location:{origin:'https://owner.github.io'},document:{getElementById:id=>{if(!nodes.has(id))nodes.set(id,new Node());return nodes.get(id);},createElement:t=>new Node(t),querySelector:s=>s==='.history-records'?detail:null,querySelectorAll:()=>[],addEventListener(){},head:new Node(),body:new Node()}});
+function runtime(app=false){const clock=timers(),nodes=new Map(),detail=Object.assign(new Node(),{open:true}),g=vm.createContext({console,crypto,structuredClone,Map,Set,Date,Intl,TimeCore:C,IDBKeyRange,indexedDB:new IDBFactory(),atob:s=>Buffer.from(s,'base64').toString(),setTimeout:clock.setTimeout,clearTimeout:clock.clearTimeout,setInterval(){},addEventListener(){},navigator:{onLine:true},location:{origin:'https://owner.github.io'},document:{getElementById:id=>{if(!nodes.has(id))nodes.set(id,new Node());return nodes.get(id);},createElement:t=>new Node(t),querySelector:s=>s==='.history-records'?detail:null,querySelectorAll:()=>[],addEventListener(){},head:new Node(),body:new Node()}});
   for(const f of ['db.js','ux.js','transport.js'])vm.runInContext(fs.readFileSync('frontend/'+f,'utf8'),g,{filename:f});
   if(app){let source=fs.readFileSync('frontend/app.js','utf8');source=source.slice(0,source.lastIndexOf('init().catch'));g.TimeTransport.ready=()=>true;g.google={accounts:{id:{initialize(){},renderButton(){},prompt(){}}}};vm.runInContext(source,g,{filename:'app.js'});}
   return {g,clock,nodes,detail,run:s=>vm.runInContext(s,g)};
@@ -27,7 +27,7 @@ test('optimistic edit/split/cross-year effects, ten queued modifications share o
   await D.enqueue({type:'edit',year:'2026',event_id:e.event_id,patch:{start_at:'2027-01-02T00:00:00Z',end_at:'2027-01-02T00:00:15Z'}});assert.equal(C.eventYear((await D.snapshot()).events.find(v=>v.event_id===e.event_id)),'2027');
   for(let i=0;i<7;i++)await D.enqueue({type:'edit',year:'2027',event_id:e.event_id,patch:{note:'note'+i}});calls.length=0;await run('sync()');assert.deepEqual(calls.map(p=>p.action),['sync_batch']);assert.equal(calls[0].ops.length,10);assert.equal((await D.snapshot()).ops.length,0);
 });
-test('confirmed effects update summary atomically; delayed older query cannot roll totals back',async()=>{const {D,run,env}=await app(),e=event();await D.enqueue({type:'import',events:[e]});await run('sync()');const old=clone(env.context.query_({mode:'all'})),key='query:all:all';await D.cache(key,old);await D.enqueue({type:'edit',year:'2026',event_id:e.event_id,patch:{start_at:'2027-01-02T00:00:00Z',end_at:'2027-01-02T00:01:00Z'}});await run('sync()');assert.equal((await D.get('cache',key)).total.total_seconds,60);const stale=await D.cache(key,old);assert.equal(stale.total.total_seconds,60);assert.equal(stale.state.revision,2);});
+test('confirmed effects reconcile separately; delayed older query cannot roll totals back',async()=>{const {D,run,env}=await app(),e=event();await D.enqueue({type:'import',events:[e]});await run('sync()');const old=clone(env.context.query_({mode:'all'})),key='query:all:all';await D.cache(key,old);await D.enqueue({type:'edit',year:'2026',event_id:e.event_id,patch:{start_at:'2027-01-02T00:00:00Z',end_at:'2027-01-02T00:01:00Z'}});const pending=await D.getSyncState();await run('sync()');await D.reconcileConfirmedCaches(pending.ops.map(i=>({revision:i.op.base_revision,effects:i.effects})));assert.equal((await D.get('cache',key)).total.total_seconds,60);const stale=await D.cache(key,old);assert.equal(stale.total.total_seconds,60);assert.equal(stale.state.revision,2);});
 test('old records response cannot override a newer confirmed edit or newer pagination generation',async()=>{const {D,run}=await app(),e=event();await D.enqueue({type:'import',events:[e]});await run('sync()');await D.rememberPage('2026',{events:[{...e,revision:1}],offset:0,next:null,cloud_revision:1});await D.enqueue({type:'edit',year:'2026',event_id:e.event_id,patch:{note:'new'}});await run('sync()');await D.rememberPage('2026',{events:[e],offset:0,next:null,cloud_revision:1});assert.equal((await D.snapshot()).events[0].note,'new');});
 test('complete fresh remote cache removes stale remote-deleted events but protects unsynced edits',async()=>{const {D}=await app(),a=event(),b=event(1);await D.remember([a,b]);await D.enqueue({type:'edit',year:'2026',event_id:b.event_id,patch:{note:'pending'}});await D.rememberPage('2026',{events:[],offset:0,next:null,cloud_revision:1});const s=await D.snapshot();assert.equal(s.events.length,1);assert.equal(s.events[0].event_id,b.event_id);assert.equal(s.events[0].note,'pending');});
 test('large batches respect envelope budget and preserve queue order',()=>{const {g}=runtime(),ops=Array.from({length:10},(_,i)=>({op_id:String(i),op:{note:'x'.repeat(20000)}})),selected=g.TimeUX.batch(ops);assert.equal(selected.length,4);assert.deepEqual(clone(selected.map(i=>i.op_id)),['0','1','2','3']);});
@@ -52,7 +52,7 @@ test('A: unresolved sync_batch cannot block math → english → fitness or disa
   for(const [i,key]of ['math','english','fitness'].entries()){r.g.spec=activity(key,at+i*1000);await r.run('act(spec)');}
   const s=await r.D.snapshot();assert.equal(s.local.current.event_key,'fitness');assert.equal(s.ops.length,5);assert.deepEqual(s.ops.slice(2).map(i=>i.op.event_key),['math','english','fitness']);
   assert.equal(r.nodes.get('current-name').textContent,'健身');assert.equal(buttons.find(b=>b.dataset.eventKey==='fitness').className,'active');assert.ok(buttons.every(b=>!b.disabled));assert.deepEqual(r.nodes.get('quick').children,buttons,'buttons must retain identity');
-  assert.match(r.nodes.get('toast').textContent,/正在同步 2 条记录/);
+  assert.match(r.nodes.get('toast').textContent,/正在同步…/);
   hold.release();await flight;assert.equal((await r.D.snapshot()).ops.length,0);assert.equal(r.env.context.state_().current.event_key,'fitness');assert.equal(r.nodes.get('current-name').textContent,'健身');assert.deepEqual(r.calls.filter(p=>p.action==='sync_batch').map(p=>p.ops.length),[2,3]);
 });
 test('B: 100 cached cards, closed history, 30-second network stall: fast path touches no records DOM/cache',{timeout:3000},async()=>{
@@ -94,3 +94,78 @@ test('stop during an unresolved batch is durable and immediately clears current 
 test('simultaneous enqueue and acknowledgement are safe in either IDB transaction order',async()=>{for(const acknowledgeFirst of [true,false]){const r=await app(),at=await start408(r),s=await r.D.snapshot(),reply=clone(r.env.context.commitBatch_(s.ops.map(o=>o.op))),ack=()=>r.D.acceptBatch(reply.confirmed,reply.state),add=()=>r.D.enqueue(activity('math',at));await Promise.all(acknowledgeFirst?[ack(),add()]:[add(),ack()]);const result=await r.D.snapshot();assert.equal(result.ops.length,1);assert.equal(result.local.current.event_key,'math');assert.equal(result.local.revision,3);assert.equal(result.ops[0].op.base_revision,2);}});
 test('failed fast transaction leaves durable current and displayed current unchanged',async()=>{const r=await app();await start408(r);const before=await r.D.snapshot();r.g.spec={type:'stop',at:'2025-01-01T00:00:00Z'};const report=r.g.console;r.g.console={...console,error(){}};await assert.rejects(r.run('act(spec)'));r.g.console=report;assert.deepEqual(await r.D.snapshot(),before);assert.equal(r.nodes.get('current-name').textContent,'408');});
 
+
+// Keep an actual cache-only write transaction alive until explicitly released.
+// A Promise alone would not expose IndexedDB store-lock regressions.
+function holdCacheWrites(r){
+  const started=deferred(),gate=deferred();let held,release=false;
+  r.D.reconcileConfirmedCaches=()=>held||(held=new Promise((resolve,reject)=>{
+    const tx=r.database.transaction('cache','readwrite'),store=tx.objectStore('cache');
+    gate.promise.then(()=>release=true);
+    const pump=()=>{const q=store.get('settings');q.onsuccess=()=>{started.resolve(tx);if(!release)pump();};};pump();
+    tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);
+  }));
+  return {started:started.promise,release:()=>gate.resolve(),done:()=>held};
+}
+async function cachedHistory(r,n=100){const rows=Array.from({length:n},(_,i)=>event(i));await r.D.rememberPage('2026',{events:rows,offset:0,next:null,cloud_revision:0});return rows;}
+
+test('E: acknowledgement resolves before a held cache write; three switches persist and paint',{timeout:3000},async()=>{
+  const r=await app();await cachedHistory(r);for(let i=0;i<4;i++)await r.D.cache('query:test:'+i,clone(r.env.context.query_({mode:'all'})));
+  const at=Date.now()-20000;for(const [i,key]of ['math','english','fitness','math','cs408'].entries())await r.D.enqueue(activity(key,at+i*1000));await r.run('repaint()');
+  const cache=holdCacheWrites(r);await r.run('sync()');r.clock.advance(0);const tx=await cache.started;assert.deepEqual([...tx.objectStoreNames],['cache']);
+  try{for(const [i,key]of ['math','english','fitness'].entries()){r.g.spec=activity(key,at+(i+5)*1000);await r.run('act(spec)');}
+    assert.equal((await r.D.getCurrent()).event_key,'fitness');assert.equal(r.nodes.get('current-name').textContent,'健身');assert.equal(await r.D.getQueueCount(),3);
+  }finally{cache.release();await cache.done();}
+});
+
+test('F: acknowledgement core locks only meta/ops; bounded keyed reads, no bulk reads',async()=>{
+  const r=await app();await cachedHistory(r);await start408(r);const s=await r.D.getSyncState(),io=instrument(r.database);
+  await r.D.acceptBatchCore(s.ops.map(i=>i.op_id),s.local);io.restore();
+  assert.deepEqual(io.transactions,[{stores:['meta','ops'],mode:'readwrite'}]);
+  assert.ok(io.requests.every(q=>['meta','ops'].includes(q.store)&&!q.method.startsWith('getAll')));
+  assert.equal(io.requests.filter(q=>q.store==='ops'&&q.method==='get').length,2);
+  assert.equal(io.requests.filter(q=>q.store==='ops'&&q.method==='count').length,1);
+});
+
+test('G: 1000 caches and 100 record pages cannot increase acknowledgement/switch I/O',{timeout:5000},async()=>{
+  const counts=[];for(const size of [0,1000]){const r=await app();
+    await new Promise((resolve,reject)=>{const tx=r.database.transaction('cache','readwrite'),s=tx.objectStore('cache');for(let i=0;i<size;i++)s.put({payload:'x'.repeat(100)},'other:'+i);for(let i=0;i<(size?100:0);i++)s.put({pages:{[i*100]:{ids:[],next:null}}},'records:page:'+i);for(let i=0;i<(size?10:0);i++)s.put(clone(r.env.context.query_({mode:'all'})),'query:'+i);tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);});
+    const at=await start408(r),s=await r.D.getSyncState(),io=instrument(r.database);r.g.spec=activity('math',at);
+    await Promise.all([r.D.acceptBatchCore(s.ops.map(i=>i.op_id),s.local),r.run('act(spec)')]);io.restore();
+    counts.push({transactions:io.transactions.length,reads:io.requests.filter(q=>['get','count','openKeyCursor'].includes(q.method)).length});
+    assert.ok(io.requests.every(q=>q.store!=='cache'&&!q.method.startsWith('getAll')));assert.equal((await r.D.getCurrent()).event_key,'math');
+  }assert.deepEqual(counts,[{transactions:2,reads:12},{transactions:2,reads:12}]);
+});
+
+test('H: aborted cache reconciliation cannot undo acknowledgement; fresh query repairs summaries',{timeout:3000},async()=>{
+  const r=await app(),e=event();await r.D.enqueue({type:'import',events:[e]});await r.run('sync()');const key='query:all:all';await r.D.cache(key,clone(r.env.context.query_({mode:'all'})));
+  await r.D.enqueue({type:'edit',year:'2026',event_id:e.event_id,patch:{note:'confirmed'}});const s=await r.D.getSyncState(),reply=clone(r.env.context.commitBatch_(s.ops.map(i=>i.op)));
+  await r.D.enqueue(activity('math',Date.now()-1000));const accepted=await r.D.acceptBatch(reply.confirmed,reply.state);
+  const original=r.database.transaction.bind(r.database);r.database.transaction=(stores,mode,...args)=>{const tx=original(stores,mode,...args);if(stores==='cache'&&mode==='readwrite'){const store=tx.objectStore('cache'),cursor=store.openCursor.bind(store);store.openCursor=(...a)=>{const req=cursor(...a);req.addEventListener('success',()=>tx.abort(),{once:true});return req;};}return tx;};
+  await assert.rejects(r.D.reconcileConfirmedCaches(accepted));r.database.transaction=original;
+  const after=await r.D.getSyncState();assert.equal(after.ops.length,1);assert.equal(after.cloud.revision,2);assert.equal(after.local.current.event_key,'math');
+  r.g.spec=activity('english',Date.now());await r.run('act(spec)');assert.equal(await r.D.getQueueCount(),2);
+  await r.run('sync()');await r.run("view='history';historyMode='all';renderStats(true)");
+  assert.equal((await r.D.get('cache',key)).state.revision,4);assert.equal(await r.D.getQueueCount(),0);
+});
+
+test('I: history deletes acknowledged while cache locked; every quick switch completes',{timeout:3000},async()=>{
+  const r=await app(),rows=Array.from({length:5},(_,i)=>event(i));await r.D.enqueue({type:'import',events:rows});await r.run('sync()');await r.run('loadRecords()');
+  const at=Date.now()-10000;await r.D.enqueue(activity('cs408',at));for(const e of rows.slice(0,3)){r.g.e=e;await r.run("act({type:'delete',year:'2026',event_id:e.event_id})");}
+  const cache=holdCacheWrites(r);await r.run('sync()');r.clock.advance(0);await cache.started;
+  try{for(const [i,key]of ['english','cs50p','fragmented','entertainment'].entries()){
+      const def=C.DEFAULT_CONFIG.events.find(d=>d.id===key);assert.ok(def,'known activity '+key);r.g.spec=activity(key,at+(i+1)*1000);await r.run('act(spec)');assert.equal((await r.D.getCurrent()).event_key,key);assert.equal(r.nodes.get('current-name').textContent,def.name);
+    }assert.equal(await r.D.getQueueCount(),4);
+  }finally{cache.release();await cache.done();}
+});
+
+
+test('missed reconciliation/reload never labels stale totals current; later query repairs them',async()=>{
+  const r=await app(),key='query:all:all',old=clone(r.env.context.query_({mode:'all'}));await r.D.cache(key,{...old,fetched_at:Date.now()});
+  for(let i=0;i<2;i++)await r.D.enqueue({type:'import',events:[event(i)]});const s=await r.D.getSyncState(),reply=clone(r.env.context.commitBatch_(s.ops.map(i=>i.op)));
+  const accepted=await r.D.acceptBatchCore(reply.confirmed,reply.state);await r.D.reconcileConfirmedCaches(accepted.slice(1));
+  assert.equal((await r.D.get('cache',key)).state.revision,0,'missing prefix must not be skipped');
+  await r.D.open();await r.run("repaint();view='history';historyMode='all';renderStats(false,true)");
+  assert.match(r.nodes.get('stats-note').textContent,/仅本机已缓存/);assert.equal(await r.D.getQueueCount(),0);
+  await r.run('renderStats(true)');assert.equal((await r.D.get('cache',key)).state.revision,2);
+});

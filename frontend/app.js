@@ -58,7 +58,7 @@ async function sync(){
   if(!T.ready()){googleLogin();return;}
   const run=async()=>{busy=true;clearTimeout(statsTimer);paintStatus();try{
     let s=await D.getSyncState();if(s.conflict)return;
-    const types=new Set(s.ops.map(i=>i.op.type));notify(`正在同步 ${s.ops.length} 条记录`,'loading','sync');
+    const types=new Set(s.ops.map(i=>i.op.type));notify('正在同步…','loading','sync');
     if(!s.ops.length){const r=await send({action:'state'});await D.remote(r.state);}
     else while(s.ops.length){const batch=TimeUX.batch(s.ops);const r=await send({action:'sync_batch',ops:batch.map(i=>i.op)});await TimeUX.acceptResponse(D,batch,r);s=await D.getSyncState();if(s.conflict)throw new Error('设备冲突');}
     retryMs=5000;await refreshCurrent();announce();toast.clear('sync');notify(types.size===1?({delete:'删除已同步到云端',edit:'修改已同步',split:'拆分已同步'})[[...types][0]]||'同步完成':'同步完成');deferLocalStats();deferStats();
@@ -107,6 +107,8 @@ async function renderStats(refresh=false,localOnly=false){
       const response=await send({action:'query',...q});r=await D.cache(key,{...response,fetched_at:Date.now()});
     }
     const s=await D.snapshot();if(gen!==statsGeneration)return;
+    // Cache reconciliation is disposable: never treat an older summary as current.
+    if(r&&s.cloud&&r.state.revision<s.cloud.revision){r=null;if(!localOnly&&!busy)deferStats();}
     let total=C.clone(r?.total||C.emptySummary('total')),days=new Map((r?.days||[]).map(d=>[d.date,C.clone(d)])),rev=r?.state.revision;
     if(r){for(const item of s.ops){if(item.op.base_revision<rev)continue;for(const change of item.effects)for(const [e,sign]of [[change.before,-1],[change.after,1]])if(e)for(const p of C.splitDays(e))if(p.date>=range.from&&p.date<range.to){C.addSegment(total,p,sign);if(!days.has(p.date))days.set(p.date,C.emptySummary(p.date));C.addSegment(days.get(p.date),p,sign);}}}
     else {for(const event of s.events)for(const p of C.splitDays(event))if(p.date>=range.from&&p.date<range.to){C.addSegment(total,p);if(!days.has(p.date))days.set(p.date,C.emptySummary(p.date));C.addSegment(days.get(p.date),p);}}

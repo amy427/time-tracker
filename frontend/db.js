@@ -13,8 +13,9 @@
   async function all(store){return request(db.transaction(store).objectStore(store).getAll());}
   function initial(){return {revision:0,current:null,config:TimeCore.clone(TimeCore.DEFAULT_CONFIG),last_operation_id:null};}
   // Read -> derive -> write within one transaction. No awaited network or timer inside.
-  function mutate(fn,{events=true,caches=true}={}){return new Promise((resolve,reject)=>{
-    const tx=db.transaction(['meta','ops','events','conflicts','cache'],'readwrite'),m=tx.objectStore('meta'),o=tx.objectStore('ops'),e=tx.objectStore('events'),c=tx.objectStore('conflicts'),cacheStore=tx.objectStore('cache');
+  function mutate(fn,{events=true,caches=true,conflicts=false}={}){return new Promise((resolve,reject)=>{
+    const stores=['meta','ops',...(events?['events']:[]),...(caches?['cache']:[]),...(conflicts?['conflicts']:[])];
+    const tx=db.transaction(stores,'readwrite'),m=tx.objectStore('meta'),o=tx.objectStore('ops'),e=events?tx.objectStore('events'):null,c=conflicts?tx.objectStore('conflicts'):null,cacheStore=caches?tx.objectStore('cache'):null;
     const reads=[m.get('local'),m.get('cloud'),o.getAll(),events?e.getAll():null,m.get('device'),m.get('conflict'),caches?cacheStore.getAllKeys():null,caches?cacheStore.getAll():null];let n=0,result;
     const values=[];reads.forEach((r,i)=>{const done=()=>{values[i]=r?r.result:[];if(++n===reads.length){try{result=fn({local:values[0]||initial(),cloud:values[1]||null,ops:values[2]||[],events:values[3]||[],device:values[4]||crypto.randomUUID(),conflict:values[5]||null,caches:new Map(values[6].map((k,j)=>[k,values[7][j]])),cacheStore,m,o,e,c});}catch(err){reject(err);tx.abort();}}};if(r)r.onsuccess=done;else done();});
     tx.oncomplete=()=>resolve(result);tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||new Error('本地保存中断'));
@@ -62,30 +63,53 @@
     for(const w of plan.writes)s.e.put(w.event);
     s.o.put({op_id:op.op_id,seq,op,effects});s.m.put(plan.state,'local');s.m.put(s.device,'device');return plan.state;
   }
-  async function acceptBatch(ids,state){return mutate(s=>{
-    const confirmed=new Set(ids),accepted=s.ops.filter(o=>confirmed.has(o.op_id)).sort((a,b)=>a.seq-b.seq);
-    for(const item of accepted)s.o.delete(item.op_id);
-    // Fold confirmed effects into cached summaries atomically with queue removal.
-    // Otherwise the delayed cloud query would temporarily erase optimistic totals.
-    for(const [key,r]of s.caches)if(key.startsWith('query:')&&r.state&&r.range){
-      for(const item of accepted){if(item.op.base_revision<r.state.revision)continue;
+  // Reliable acknowledgement is bounded by the batch size, never by cache/queue size.
+  function acceptBatchCore(ids,state){return new Promise((resolve,reject)=>{
+    const unique=[...new Set(ids)];if(unique.length>10){reject(new Error('确认批次超过 10 个操作'));return;}
+    const tx=db.transaction(['meta','ops'],'readwrite'),m=tx.objectStore('meta'),o=tx.objectStore('ops');
+    const reads=[m.get('local'),m.get('cloud'),m.get('conflict'),o.count(),...unique.map(id=>o.get(id))];
+    const values=[];let remaining=reads.length,accepted=[];
+    for(const [i,r]of reads.entries())r.onsuccess=()=>{values[i]=r.result;if(--remaining)return;
+      accepted=values.slice(4).filter(Boolean).sort((a,b)=>a.seq-b.seq);
+      for(const item of accepted)o.delete(item.op_id);
+      const [local,cloud,conflict,count]=values;
+      if(!cloud||state.revision>=cloud.revision)m.put(state,'cloud');
+      if(!conflict&&count===accepted.length&&state.revision>=(local?.revision||0))m.put(state,'local');
+    };
+    tx.oncomplete=()=>resolve(accepted.map(({op,effects})=>({revision:op.base_revision,effects})));
+    tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||new Error('确认保存中断'));
+  });}
+  // Derived summaries have no transaction overlap with enqueue. Cursor callbacks yield
+  // between entries and never materialize records pages or the complete cache store.
+  function reconcileConfirmedCaches(accepted){return new Promise((resolve,reject)=>{
+    const tx=db.transaction('cache','readwrite'),store=tx.objectStore('cache');
+    const read=store.openCursor(IDBKeyRange.bound('query:','query:\uffff'));
+    read.onsuccess=()=>{const cursor=read.result;if(!cursor)return;const r=cursor.value;
+      if(r.state&&r.range){for(const item of accepted){
+        if(item.revision<r.state.revision)continue;
+        // A missed earlier reconciliation cannot safely be patched with later effects.
+        if(item.revision>r.state.revision){r.fetched_at=0;break;}
         for(const change of item.effects)for(const [ev,sign]of [[change.before,-1],[change.after,1]])if(ev)for(const p of TimeCore.splitDays(ev))if(p.date>=r.range.from&&p.date<r.range.to){TimeCore.addSegment(r.total,p,sign);let d=r.days.find(d=>d.date===p.date);if(!d){d=TimeCore.emptySummary(p.date);r.days.push(d);}TimeCore.addSegment(d,p,sign);}
-        r.state.revision=item.op.base_revision+1;
-      }s.cacheStore.put(r,key);
-    }
-    if(!s.cloud||state.revision>=s.cloud.revision)s.m.put(state,'cloud');
-    // Check the live transaction's queue, not the batch's earlier snapshot.
-    if(!s.conflict&&!s.ops.some(o=>!confirmed.has(o.op_id))&&state.revision>=s.local.revision)s.m.put(state,'local');
-    // Annual pages are durable caches, not a rolling 90-day window.
-  },{events:false});}
+        r.state.revision=item.revision+1;
+      }cursor.update(r);}cursor.continue();
+    };
+    tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||new Error('统计缓存更新中断'));
+  });}
+  async function acceptBatch(ids,state){
+    const accepted=await acceptBatchCore(ids,state);
+    // Resolve acknowledgement before scheduling disposable cache work. Failure must
+    // never resurrect acknowledged UUIDs. Stats rejects caches behind cloud revision.
+    if(accepted.length)setTimeout(()=>{Promise.resolve().then(()=>root.TimeDB.reconcileConfirmedCaches(accepted)).catch(()=>{});},0);
+    return accepted;
+  }
   async function accept(opId,state){return acceptBatch([opId],state);}
   async function remote(state){return mutate(s=>{if(!s.cloud||state.revision>=s.cloud.revision)s.m.put(state,'cloud');if(!s.ops.length&&!s.conflict&&state.revision>=s.local.revision)s.m.put(state,'local');},{events:false,caches:false});}
   async function freeze(state){return mutate(s=>{s.m.put({state,at:new Date().toISOString()},'conflict');s.m.put(state,'cloud');},{events:false,caches:false});}
   async function useCloud(){return mutate(s=>{
     if(!s.conflict)throw new Error('没有待处理冲突');s.c.put({id:crypto.randomUUID(),saved_at:new Date().toISOString(),local:s.local,ops:s.ops,events:s.events});s.o.clear();s.e.clear();for(const key of s.caches.keys())if(key.startsWith('records:')||key.startsWith('query:'))s.cacheStore.delete(key);s.m.put(s.conflict.state,'local');s.m.put(s.conflict.state,'cloud');s.m.delete('conflict');return s.conflict.state;
-  });}
+  },{conflicts:true});}
   async function cache(key,value){return new Promise((resolve,reject)=>{const tx=db.transaction('cache','readwrite'),s=tx.objectStore('cache'),r=s.get(key);let saved=value;r.onsuccess=()=>{if(key.startsWith('query:')&&r.result?.state.revision>value.state.revision)saved=r.result;else s.put(value,key);};tx.oncomplete=()=>resolve(saved);tx.onerror=()=>reject(tx.error);});}
-  async function remember(events){return mutate(s=>{const protectedIds=new Set(s.ops.flatMap(o=>o.effects.map(e=>e.after.event_id)));for(const e of events)if(!protectedIds.has(e.event_id))s.e.put(e);});}
+  async function remember(events){return mutate(s=>{const protectedIds=new Set(s.ops.flatMap(o=>o.effects.map(e=>e.after.event_id)));for(const e of events)if(!protectedIds.has(e.event_id))s.e.put(e);},{events:true,caches:false});}
   async function rememberPage(year,response){return mutate(s=>{
     const key='records:'+year,old=s.caches.get(key),same=old&&old.cloud_revision===response.cloud_revision;
     if(old&&old.cloud_revision>response.cloud_revision)return old;
@@ -104,7 +128,7 @@
     TimeCore.assert(backup?.schema_version===1&&backup.kind==='local-recovery','不是本地恢复副本');TimeCore.validateConfig(backup.local.config);TimeCore.assert(Number.isSafeInteger(backup.local.revision)&&Array.isArray(backup.ops)&&Array.isArray(backup.events),'副本结构无效');
     if(backup.local.current)TimeCore.validateEvent({...backup.local.current,end_at:backup.local.current.start_at});
     const events=backup.events.map(TimeCore.validateEvent),ids=new Set();for(const item of backup.ops){TimeCore.assert(TimeCore.uuid(item.op_id)&&item.op_id===item.op.op_id&&!ids.has(item.op_id)&&TimeCore.uuid(item.op.device_id)&&Number.isSafeInteger(item.op.base_revision),'队列校验失败');ids.add(item.op_id);}
-    return mutate(s=>{TimeCore.assert(!s.local.current&&!s.ops.length,'先结束活动并完成同步，再恢复本地副本');s.e.clear();for(const key of s.caches.keys())if(key.startsWith('records:')||key.startsWith('query:'))s.cacheStore.delete(key);for(const e of events)s.e.put(e);for(const item of backup.ops)s.o.put(item);s.m.put(backup.local,'local');if(backup.cloud)s.m.put(backup.cloud,'cloud');else s.m.delete('cloud');s.m.put(TimeCore.uuid(backup.device)?backup.device:crypto.randomUUID(),'device');if(backup.conflict)s.m.put(backup.conflict,'conflict');else s.m.delete('conflict');for(const branch of backup.conflicts||[])s.c.put(branch);});
+    return mutate(s=>{TimeCore.assert(!s.local.current&&!s.ops.length,'先结束活动并完成同步，再恢复本地副本');s.e.clear();for(const key of s.caches.keys())if(key.startsWith('records:')||key.startsWith('query:'))s.cacheStore.delete(key);for(const e of events)s.e.put(e);for(const item of backup.ops)s.o.put(item);s.m.put(backup.local,'local');if(backup.cloud)s.m.put(backup.cloud,'cloud');else s.m.delete('cloud');s.m.put(TimeCore.uuid(backup.device)?backup.device:crypto.randomUUID(),'device');if(backup.conflict)s.m.put(backup.conflict,'conflict');else s.m.delete('conflict');for(const branch of backup.conflicts||[])s.c.put(branch);},{conflicts:true});
   }
-  root.TimeDB={open,get,all,snapshot,getOverview,getSyncState,getLocalState,getCurrent,getQueueCount,enqueue,accept,acceptBatch,remote,freeze,useCloud,cache,remember,rememberPage,restoreLocal};
+  root.TimeDB={open,get,all,snapshot,getOverview,getSyncState,getLocalState,getCurrent,getQueueCount,enqueue,accept,acceptBatch,acceptBatchCore,reconcileConfirmedCaches,remote,freeze,useCloud,cache,remember,rememberPage,restoreLocal};
 })(globalThis);
