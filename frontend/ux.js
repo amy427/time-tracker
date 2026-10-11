@@ -26,10 +26,12 @@
   }
   function batch(ops){const result=[];let size=0;for(const item of ops.slice(0,10)){const length=JSON.stringify(item.op).length+1;if(result.length&&size+length>85000)break;result.push(item);size+=length;}return result;}
   function recordsView(s,year,offset,meta){
-    const pendingIds=new Set(s.ops.flatMap(o=>o.effects.map(e=>e.after.event_id)));
-    const ids=meta?.pages[0]?new Set(Object.values(meta.pages).flatMap(p=>p.ids)):null;
-    return s.events.filter(e=>!e.deleted&&TimeCore.eventYear(e)===year&&(!ids||ids.has(e.event_id)||pendingIds.has(e.event_id)||e.revision>meta.cloud_revision))
-      .sort((a,b)=>TimeCore.time(b.start_at)-TimeCore.time(a.start_at)||a.event_id.localeCompare(b.event_id)).slice(offset,offset+100);
+    const pageIds=new Set(meta?.pages[offset]?.ids||[]),byId=new Map(s.events.filter(e=>!pageIds.size||pageIds.has(e.event_id)).map(e=>[e.event_id,e]));
+    for(const item of s.ops)for(const change of item.effects){const e=change.after;
+      if(pageIds.has(e.event_id)||pageIds.has(item.op?.event_id)||offset===0&&!Object.values(meta?.pages||{}).some(p=>p.ids.includes(e.event_id)))byId.set(e.event_id,e);
+    }
+    return [...byId.values()].filter(e=>!e.deleted&&TimeCore.eventYear(e)===year)
+      .sort((a,b)=>TimeCore.time(b.start_at)-TimeCore.time(a.start_at)||a.event_id.localeCompare(b.event_id)).slice(0,100);
   }
   root.TimeUX={toast,identity,acceptResponse,recordsView,batch};
 })(globalThis);

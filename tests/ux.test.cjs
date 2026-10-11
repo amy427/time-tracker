@@ -2,8 +2,8 @@ const test=require('node:test'),assert=require('node:assert/strict'),fs=require(
 const {IDBFactory,IDBKeyRange}=require('fake-indexeddb'),C=require('../frontend/core.js'),{environment}=require('./fake-gas.cjs');
 const clone=v=>JSON.parse(JSON.stringify(v));
 function timers(){let now=0,next=0;const jobs=new Map();return {jobs,setTimeout(fn,ms){const id=++next;jobs.set(id,{fn,at:now+ms});return id;},clearTimeout(id){jobs.delete(id);},advance(ms){now+=ms;for(const [id,j]of [...jobs])if(j.at<=now){jobs.delete(id);j.fn();}},now:()=>now};}
-class Node{constructor(tag='div'){this.tagName=tag;this.children=[];this.dataset={};this.style={};this.hidden=false;this.value='';this.textContent='';this.attrs={};}append(...v){this.children.push(...v);}prepend(...v){this.children.unshift(...v);}replaceChildren(...v){this.children=[...v];}setAttribute(k,v){this.attrs[k]=v;}addEventListener(){}scrollIntoView(){}showModal(){this.open=true;}close(){this.open=false;}}
-function runtime(app=false){const clock=timers(),nodes=new Map(),detail=Object.assign(new Node(),{open:true}),g=vm.createContext({console,crypto,structuredClone,Map,Set,Date,Intl,TimeCore:C,IDBKeyRange,indexedDB:new IDBFactory(),atob:s=>Buffer.from(s,'base64').toString(),setTimeout:clock.setTimeout,clearTimeout:clock.clearTimeout,setInterval(){},addEventListener(){},navigator:{onLine:true},location:{origin:'https://owner.github.io'},document:{getElementById:id=>{if(!nodes.has(id))nodes.set(id,new Node());return nodes.get(id);},createElement:t=>new Node(t),querySelector:s=>s==='.history-records'?detail:null,querySelectorAll:()=>[],addEventListener(){},head:new Node(),body:new Node()}});
+class Node{constructor(tag='div'){this.tagName=tag;this.children=[];this.dataset={};this.style={};this.hidden=false;this.value='';this.textContent='';this.attrs={};}append(...v){for(const n of v)n.parent=this;this.children.push(...v);}prepend(...v){for(const n of v)n.parent=this;this.children.unshift(...v);}replaceChildren(...v){this.children=[];this.append(...v);}remove(){if(this.parent)this.parent.children=this.parent.children.filter(n=>n!==this);}replaceWith(n){const p=this.parent;if(p){n.parent=p;p.children[p.children.indexOf(this)]=n;}}get lastElementChild(){return this.children.at(-1);}setAttribute(k,v){this.attrs[k]=v;}addEventListener(){}scrollIntoView(){}showModal(){this.open=true;}close(){this.open=false;}}
+function runtime(app=false,debug=false){const clock=timers(),nodes=new Map(),detail=Object.assign(new Node(),{open:true}),g=vm.createContext({console,crypto,structuredClone,Map,Set,Date,Intl,TimeCore:C,IDBKeyRange,indexedDB:new IDBFactory(),atob:s=>Buffer.from(s,'base64').toString(),setTimeout:clock.setTimeout,clearTimeout:clock.clearTimeout,setInterval(){},addEventListener(){},navigator:{onLine:true},location:{origin:'https://owner.github.io',search:debug?'?debug=1':''},document:{getElementById:id=>{if(!nodes.has(id))nodes.set(id,new Node());return nodes.get(id);},createElement:t=>new Node(t),querySelector:s=>s==='.history-records'?detail:null,querySelectorAll:()=>[],addEventListener(){},head:new Node(),body:new Node()}});
   for(const f of ['db.js','ux.js','transport.js'])vm.runInContext(fs.readFileSync('frontend/'+f,'utf8'),g,{filename:f});
   if(app){let source=fs.readFileSync('frontend/app.js','utf8');source=source.slice(0,source.lastIndexOf('init().catch'));g.TimeTransport.ready=()=>true;g.google={accounts:{id:{initialize(){},renderButton(){},prompt(){}}}};vm.runInContext(source,g,{filename:'app.js'});}
   return {g,clock,nodes,detail,run:s=>vm.runInContext(s,g)};
@@ -86,7 +86,7 @@ test('switch/stop: exactly one bounded IDB transaction, no getAll/cache/network 
 });
 test('history repaint post-work cannot hold the input serial queue; closed config/import skip cards',{timeout:3000},async()=>{
   const r=await app(),at=await start408(r),started=deferred(),gate=deferred();r.g.startHistory=started.resolve;r.g.historyGate=gate.promise;r.run("recordsYear='2026';paintRecords=()=>{startHistory();return historyGate;};");
-  r.g.e=event();const importing=r.run("act({type:'import',events:[e]})");await started.promise;r.g.spec=activity('english',at);await r.run('act(spec)');assert.equal(r.nodes.get('current-name').textContent,'英语');gate.resolve();await importing;
+  r.g.e=event();const importing=r.run("act({type:'import',events:[e]})");await importing;r.clock.advance(500);await started.promise;r.g.spec=activity('english',at);await r.run('act(spec)');assert.equal(r.nodes.get('current-name').textContent,'英语');gate.resolve();await importing;
   r.detail.open=false;r.run("paintRecords=()=>{throw Error('closed history must not repaint');};");r.g.e=event(1);await r.run("act({type:'import',events:[e]})");await r.run("act({type:'config',config:snap.local.config})");
 });
 test('old duplicate acknowledgement cannot roll back an already fully confirmed newer local state',async()=>{const r=await app(),at=await start408(r),first=(await r.D.snapshot()).ops,old=clone(r.env.context.commitBatch_(first.map(i=>i.op)));await r.D.acceptBatch(old.confirmed,old.state);await r.D.enqueue(activity('math',at));await r.run('sync()');await r.D.acceptBatch(old.confirmed,old.state);assert.equal((await r.D.getCurrent()).event_key,'math');assert.equal((await r.D.getOverview()).cloud.revision,3);});
@@ -168,4 +168,84 @@ test('missed reconciliation/reload never labels stale totals current; later quer
   await r.D.open();await r.run("repaint();view='history';historyMode='all';renderStats(false,true)");
   assert.match(r.nodes.get('stats-note').textContent,/仅本机已缓存/);assert.equal(await r.D.getQueueCount(),0);
   await r.run('renderStats(true)');assert.equal((await r.D.get('cache',key)).state.revision,2);
+});
+
+async function seedLargeHistory(r,n){
+  const rows=Array.from({length:n},(_,i)=>event(i));
+  await new Promise((resolve,reject)=>{const tx=r.database.transaction('events','readwrite'),store=tx.objectStore('events');for(const e of rows)store.put(e);tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);});
+  await r.D.cache('records:2026',{year:'2026',cloud_revision:0,fetched_at:Date.now(),complete:n<=100,pages:{0:{ids:rows.slice(0,100).map(e=>e.event_id),next:n>100?100:null}}});
+  return rows;
+}
+function forbidBulkEvents(r){let calls=0;const original=r.database.transaction.bind(r.database);r.database.transaction=(...args)=>{const tx=original(...args),get=tx.objectStore.bind(tx);tx.objectStore=name=>{const store=get(name);if(name==='events')store.getAll=()=>{calls++;throw Error('mobile 5000ms events.getAll trap: hot path forbidden');};return store;};return tx;};return {calls:()=>calls,restore:()=>r.database.transaction=original};}
+async function settle(){for(let i=0;i<20;i++)await new Promise(setImmediate);}
+
+test('J: page read, optimistic delete, deferred stats and sync never bulk-read events',{timeout:3000},async()=>{
+  const r=await app(),rows=await seedLargeHistory(r,100),guard=forbidBulkEvents(r),io=instrument(r.database);
+  await r.D.cache('query:all:all',clone(r.env.context.query_({mode:'all'})));r.run("view='history';historyMode='all';");
+  await r.run('loadRecords()');r.g.e=rows[0];await r.run("act({type:'delete',year:'2026',event_id:e.event_id})");
+  assert.ok(r.nodes.get('records').children.every(n=>n.dataset.eventId!==rows[0].event_id));
+  r.g.TimeTransport.call=async(_,p)=>{assert.equal(p.action,'sync_batch');return {ok:true,confirmed:p.ops.map(o=>o.op_id),state:await r.D.getLocalState()};};
+  await r.run('sync()');r.clock.advance(500);await settle();
+  assert.equal(guard.calls(),0);assert.ok(io.requests.every(q=>q.store!=='events'||q.method!=='getAll'));io.restore();guard.restore();
+});
+
+test('K: mobile 5-second bulk-read trap remains unused while background work and switches run',{timeout:3000},async()=>{
+  const r=await app();await seedLargeHistory(r,100);const at=await start408(r),guard=forbidBulkEvents(r);
+  await r.run('loadRecords()');r.g.navigator.onLine=false;
+  for(const [i,key]of ['math','english','fitness'].entries()){r.g.spec=activity(key,at+i*1000);await r.run('act(spec)');r.clock.advance(350);await settle();}
+  assert.equal(guard.calls(),0);assert.equal((await r.D.getCurrent()).event_key,'fitness');assert.equal(r.nodes.get('current-name').textContent,'健身');guard.restore();
+});
+
+test('L: 100 vs 10000 historical events: page gets <=100, delete/edit/switch counts identical',{timeout:5000},async t=>{
+  const results=[];for(const n of [100,10000]){const r=await app(),rows=await seedLargeHistory(r,n),guard=forbidBulkEvents(r),io=instrument(r.database);
+    await r.run('loadRecords()');const page=io.requests.filter(q=>q.store==='events'&&q.method==='get').length;assert.equal(page,100);
+    const stable=r.nodes.get('records').children.find(n=>n.dataset.eventId===rows[2].event_id);
+    const count=()=>({tx:io.transactions.length,reads:io.requests.filter(q=>['get','count','openKeyCursor','getAll','getAllKeys'].includes(q.method)).length});
+    io.reset();r.g.e=rows[0];await r.run("act({type:'delete',year:'2026',event_id:e.event_id})");const del=count();assert.equal(r.nodes.get('records').children.find(n=>n.dataset.eventId===rows[2].event_id),stable);
+    io.reset();r.g.e=rows[1];await r.run("act({type:'edit',year:'2026',event_id:e.event_id,patch:{note:'new'}})");const edit=count();assert.equal(r.nodes.get('records').children.find(n=>n.dataset.eventId===rows[2].event_id),stable);
+    io.reset();r.g.spec=activity('math',Date.now());await r.run('act(spec)');const sw=count();
+    results.push({page,del,edit,sw});assert.equal(guard.calls(),0);io.restore();guard.restore();
+  }assert.deepEqual(results[0],results[1]);assert.deepEqual(results[0],{page:100,del:{tx:1,reads:6},edit:{tx:1,reads:6},sw:{tx:1,reads:6}});t.diagnostic(JSON.stringify(results));
+});
+
+test('M: cached stats with 10000 events use zero events transactions and include effects/current',{timeout:5000},async()=>{
+  const r=await app();await seedLargeHistory(r,10000);const e=event(),summary=clone(r.env.context.query_({mode:'all'}));await r.D.cache('query:all:all',summary);
+  await r.D.enqueue({type:'import',events:[e]});await r.D.enqueue(activity('fitness',Date.now()-10000));await r.run('repaint()');r.run("view='history';historyMode='all';");
+  const io=instrument(r.database);await r.run('renderStats(false,true)');io.restore();
+  assert.ok(io.transactions.every(t=>!t.stores.includes('events')));assert.ok(io.requests.every(q=>q.store!=='events'));
+  assert.equal(r.nodes.get('study-total').textContent,C.duration(30));assert.equal(r.nodes.get('all-total').textContent,C.duration(40));
+});
+
+test('ten deletes patch existing DOM immediately and coalesce to one bounded reconciliation',async()=>{
+  const r=await app(),rows=await seedLargeHistory(r,100);await r.run('loadRecords()');r.g.navigator.onLine=false;const survivor=r.nodes.get('records').children.find(n=>n.dataset.eventId===rows[99].event_id);
+  r.run('var reconciles=0;const paintBefore=paintRecords;paintRecords=(...args)=>{reconciles++;return paintBefore(...args);};');
+  for(const e of rows.slice(0,10)){r.g.e=e;await r.run("act({type:'delete',year:'2026',event_id:e.event_id})");assert.ok(r.nodes.get('records').children.every(n=>n.dataset.eventId!==e.event_id));}
+  assert.equal(r.run('reconciles'),0);assert.equal(r.nodes.get('records').children.find(n=>n.dataset.eventId===rows[99].event_id),survivor);
+  r.clock.advance(500);await settle();assert.equal(r.run('reconciles'),1);assert.equal(r.nodes.get('records').children.length,90);
+});
+
+test('split patches only affected cards and survives debounce after acknowledgement',async()=>{
+  const r=await app(),rows=await seedLargeHistory(r,2);await r.run('loadRecords()');const survivor=r.nodes.get('records').children.find(n=>n.dataset.eventId===rows[1].event_id),id=crypto.randomUUID();r.g.spec={type:'split',year:'2026',event_id:rows[0].event_id,new_event_id:id,event_key:'english',at:new Date(Date.parse(rows[0].start_at)+15000).toISOString()};
+  await r.run('act(spec)');assert.ok(r.nodes.get('records').children.some(n=>n.dataset.eventId===id));assert.equal(r.nodes.get('records').children.find(n=>n.dataset.eventId===rows[1].event_id),survivor);
+  const s=await r.D.getSyncState();await r.D.acceptBatchCore(s.ops.map(o=>o.op_id),s.local);await r.run('paintRecords()');assert.ok(r.nodes.get('records').children.some(n=>n.dataset.eventId===id));
+});
+
+test('debug=1 logs tap, first IDB request, completion, current paint and explicit bulk export',async()=>{
+  for(const enabled of [false,true]){const r=runtime(true,enabled),logs=[];r.g.console={...console,debug:(tag,value)=>logs.push(value)};await r.g.TimeDB.open();await r.run('repaint()');r.g.spec=activity('math',Date.now());await r.run('act(spec)');await r.g.TimeDB.snapshot();
+    if(!enabled){assert.equal(logs.length,0);continue;}
+    for(const stage of ['tap','enqueue called','transaction created','first request success','transaction complete','paintCurrent finished','events.getAll'])assert.ok(logs.some(l=>l.stage===stage),stage);
+    assert.ok(logs.filter(l=>l.stage==='transaction complete').every(l=>l.durationMs>=0&&l.scope.length));
+    assert.ok(logs.findIndex(l=>l.stage==='enqueue called')<logs.findIndex(l=>l.stage==='paintCurrent finished'));
+  }
+});
+
+test('cold recovery reads at most 25 per transaction; page API rejects 101 IDs',async()=>{
+  const r=await app();await seedLargeHistory(r,100);const io=instrument(r.database);const chunk=await r.D.getRecoveryChunk();io.restore();assert.equal(chunk.events.length,25);assert.equal(chunk.done,false);assert.ok(io.requests.every(q=>q.method!=='getAll'));
+  await assert.rejects(r.D.getEventsByIds(Array.from({length:101},(_,i)=>String(i))),/100/);
+});
+
+test('fresh old-year page cannot delete a confirmed cross-year cached event',async()=>{
+  const r=await app(),e=event();await r.D.enqueue({type:'import',events:[e]});await r.run('sync()');await r.D.rememberPage('2026',{events:[e],offset:0,next:null,cloud_revision:1});
+  await r.D.enqueue({type:'edit',year:'2026',event_id:e.event_id,patch:{start_at:'2027-01-02T00:00:00Z',end_at:'2027-01-02T00:00:30Z'}});await r.run('sync()');await r.D.rememberPage('2026',{events:[],offset:0,next:null,cloud_revision:2});
+  assert.equal(C.eventYear((await r.D.getEventsByIds([e.event_id]))[0]),'2027');
 });

@@ -23,19 +23,21 @@ async function refreshCurrent(rebuild=false,{allowReset=false}={}){
   if(generation!==uiGeneration||request!==paintRequest||snap&&!allowReset&&latest.local.revision<snap.local.revision)return false;
   const configChanged=!snap||JSON.stringify(snap.local.config)!==JSON.stringify(latest.local.config);
   snap=latest;
-  if(rebuild||configChanged){const quick=$('quick');quick.replaceChildren();for(const def of snap.local.config.events){const b=el('button',def.name);b.dataset.eventKey=def.id;b.onclick=()=>act({type:'switch',at:new Date().toISOString(),event_id:crypto.randomUUID(),event_key:def.id});quick.append(b);}}
+  if(rebuild||configChanged){const quick=$('quick');quick.replaceChildren();for(const def of snap.local.config.events){const b=el('button',def.name);b.dataset.eventKey=def.id;b.addEventListener('pointerdown',()=>D.debug('pointerdown',{eventKey:def.id}));b.onclick=()=>act({type:'switch',at:new Date().toISOString(),event_id:crypto.randomUUID(),event_key:def.id});quick.append(b);}}
   return paintCurrent(latest.local,{allowReset});
 }
 const repaint=options=>refreshCurrent(true,options);
 function deferLocalStats(){clearTimeout(localStatsTimer);localStatsTimer=setTimeout(()=>renderStats(false,true),350);}
 function recordsAffected(spec){return ['delete','edit','split'].includes(spec.type)&&(spec.year===recordsYear||spec.patch?.start_at)||spec.type==='import'&&spec.events.some(e=>C.eventYear(e)===recordsYear);}
 function act(spec){
+  D.debug('tap',{type:spec.type});
   ++uiGeneration; // Invalidate any read started before this input, even for a no-op.
   ++statsGeneration;
   const fast=spec.type==='switch'||spec.type==='stop';
   const committed=serial.then(async()=>{
     const state=await D.enqueue(spec);
-    paintCurrent(state); // The transaction's committed post-image; no reread, even on no-op.
+    paintCurrent(state);D.debug('paintCurrent finished',{revision:state.revision});
+    if(!fast&&recordsAffected(spec))optimisticRecords(state.effects||[]); // The transaction's committed post-image; no reread, even on no-op.
     if(!fast&&recordsAffected(spec))++recordsPaintGeneration;
     notify(({delete:'已删除，正在同步…（已保存到本机）',edit:'修改已保存到本机，正在同步…',split:'拆分已保存到本机，正在同步…'})[spec.type]||'已保存到本机');
     announce();deferLocalStats();scheduleSync(300);return state;
@@ -43,7 +45,7 @@ function act(spec){
   // Only persistence/current UI is serialized. History/summary/network never enter this chain.
   serial=committed.catch(err=>{failed(err);refreshCurrent().catch(failed);});
   if(fast)return committed;
-  const finished=committed.then(async state=>{if(spec.type==='config')await repaint();if(recordsVisible()&&recordsAffected(spec))await paintRecords();return state;});finished.catch(failed);return finished;
+  const finished=committed.then(async state=>{if(spec.type==='config')await repaint();if(recordsVisible()&&recordsAffected(spec))scheduleRecordsReconcile();return state;});finished.catch(failed);return finished;
 }
 const channel=typeof BroadcastChannel!=='undefined'?new BroadcastChannel('time-tracker-v1'):null;
 function announce(){if(channel)channel.postMessage('changed');}
@@ -98,7 +100,16 @@ function selectors(){const box=$('selectors');box.replaceChildren();let mode=vie
 }
 function querySpec(){let mode=view==='history'?historyMode:view;const today=C.dateKey(Date.now(),snap.local.config.timezone);let value=(view==='history'||view==='month')?historyValue:'';if(!value)value=mode==='month'?today.slice(0,7):mode==='year'?today.slice(0,4):today;return {mode,value};}
 let statsGeneration=0;
-async function renderStats(refresh=false,localOnly=false){
+async function recoverLocalStats(range,key,generation){
+  const before=await D.getStatsState(),total=C.emptySummary('total'),days=new Map();let after;
+  while(true){if(generation!==statsGeneration)return null;const chunk=await D.getRecoveryChunk(after);
+    for(const event of chunk.events)for(const p of C.splitDays(event))if(p.date>=range.from&&p.date<range.to){C.addSegment(total,p);if(!days.has(p.date))days.set(p.date,C.emptySummary(p.date));C.addSegment(days.get(p.date),p);}
+    if(chunk.done)break;after=chunk.next;await new Promise(resolve=>setTimeout(resolve,0));
+  }
+  const latest=await D.getStatsState();if(generation!==statsGeneration||latest.local.revision!==before.local.revision)return null;
+  return D.cache(key,{total,days:[...days.values()],range,state:latest.local,local_only:true,fetched_at:0});
+}
+async function renderStats(refresh=false,localOnly=false,allowLocalRecovery=false){
   if(!snap)return;const gen=++statsGeneration,q=querySpec();let r;
   try{
     const range=C.range(q.mode,q.value,snap.local.config.timezone),key='query:'+q.mode+':'+(q.mode==='all'?'all':range.from);
@@ -106,15 +117,16 @@ async function renderStats(refresh=false,localOnly=false){
     if(!localOnly&&!busy&&navigator.onLine&&T.ready()&&configured()&&(refresh||!r||Date.now()-r.fetched_at>30000)){
       const response=await send({action:'query',...q});r=await D.cache(key,{...response,fetched_at:Date.now()});
     }
-    const s=await D.snapshot();if(gen!==statsGeneration)return;
+    if(!r&&allowLocalRecovery&&!localOnly)r=await recoverLocalStats(range,key,gen);
+    const s=await D.getStatsState();if(gen!==statsGeneration)return;
     // Cache reconciliation is disposable: never treat an older summary as current.
     if(r&&s.cloud&&r.state.revision<s.cloud.revision){r=null;if(!localOnly&&!busy)deferStats();}
     let total=C.clone(r?.total||C.emptySummary('total')),days=new Map((r?.days||[]).map(d=>[d.date,C.clone(d)])),rev=r?.state.revision;
     if(r){for(const item of s.ops){if(item.op.base_revision<rev)continue;for(const change of item.effects)for(const [e,sign]of [[change.before,-1],[change.after,1]])if(e)for(const p of C.splitDays(e))if(p.date>=range.from&&p.date<range.to){C.addSegment(total,p,sign);if(!days.has(p.date))days.set(p.date,C.emptySummary(p.date));C.addSegment(days.get(p.date),p,sign);}}}
-    else {for(const event of s.events)for(const p of C.splitDays(event))if(p.date>=range.from&&p.date<range.to){C.addSegment(total,p);if(!days.has(p.date))days.set(p.date,C.emptySummary(p.date));C.addSegment(days.get(p.date),p);}}
+    else {const known=new Map();for(const item of s.ops)for(const effect of item.effects)known.set(effect.after.event_id,effect.after);for(const event of known.values())for(const p of C.splitDays(event))if(p.date>=range.from&&p.date<range.to){C.addSegment(total,p);if(!days.has(p.date))days.set(p.date,C.emptySummary(p.date));C.addSegment(days.get(p.date),p);}}
     const cur=s.local.current;if(cur){const end=Math.max(C.time(cur.start_at),Math.min(Date.now(),C.time(cur.start_at)+C.MAX_SPAN));for(const p of C.splitDays({...cur,end_at:C.iso(end)}))if(p.date>=range.from&&p.date<range.to){C.addSegment(total,p);if(!days.has(p.date))days.set(p.date,C.emptySummary(p.date));C.addSegment(days.get(p.date),p);}}
     $('range-label').textContent=q.mode==='all'?'全部历史（年度汇总）':range.from+' 至 '+C.shiftDate(range.to,-1);
-    $('stats-note').textContent=(r?'云端汇总，截至 '+new Date(r.fetched_at).toLocaleString('zh-CN'):'仅本机已缓存记录，历史可能不完整')+'；含当前活动估计'+(s.conflict?'；设备冲突期间为本机分支估计':'');
+    $('stats-note').textContent=(r&&!r.local_only?'云端汇总，截至 '+new Date(r.fetched_at).toLocaleString('zh-CN'):'仅本机已缓存记录，历史可能不完整')+'；含当前活动估计'+(s.conflict?'；设备冲突期间为本机分支估计':'');
     $('study-total').textContent=C.duration(total.study_seconds);$('all-total').textContent=C.duration(total.total_seconds);
     const breakdown=$('breakdown');breakdown.replaceChildren();const defs=new Map(s.local.config.events.map(d=>[d.id,d.name]));for(const [id,v]of Object.entries(total.by_event))if(!defs.has(id))defs.set(id,v.name);
     for(const [id,name]of defs){if(view==='history'&&subject&&subject!==id)continue;const seconds=total.by_event[id]?.seconds||0;const row=el('div',undefined,'stat-row'),label=el('div',name),bar=el('div',undefined,'bar'),fill=el('span');fill.style.width=(total.total_seconds?Math.max(0,Math.min(100,seconds/total.total_seconds*100)):0)+'%';bar.append(fill);label.append(bar);label.style.flex='1';row.append(label,el('strong',C.duration(seconds)));breakdown.append(row);}
@@ -133,21 +145,40 @@ function inputInstant(value,tz){
   if(candidates.length>1){const choice=prompt('夏令时回拨产生两个相同本地时间。请复制选择一个 UTC 时间：\n'+candidates.join('\n'),candidates[0]);if(!candidates.includes(choice))throw new Error('未确认夏令时重叠时间');return choice;}
   return candidates[0];
 }
-let recordsYear='',recordNext=null,recordsGeneration=0,recordsPaintGeneration=0;
+let recordsYear='',recordNext=null,recordsGeneration=0,recordsPaintGeneration=0,recordsReconcileTimer;
+const recordsOptimistic=new Map();
 const recordsFlights=new Map();
 function recordsVisible(){return !!document.querySelector('.history-records')?.open;}
+function recordCard(event){
+  const card=el('div',undefined,'record');card.dataset.eventId=event.event_id;card.append(el('strong',event.event_name+' · '+C.duration(event.duration_seconds)),el('p',new Date(event.start_at).toLocaleString('zh-CN',{timeZone:event.timezone})+' → '+new Date(event.end_at).toLocaleString('zh-CN',{timeZone:event.timezone}), 'subtle'));if(event.note)card.append(el('p',event.note,'subtle'));
+    const row=el('div',undefined,'row');for(const [text,fn]of [['修改',()=>openEditor(event)],['拆分',()=>openSplitter(event)],['删除',()=>{if(confirm('删除这条记录？统计将同步扣除。Drive 原始表保留删除标记。'))act({type:'delete',year:C.eventYear(event),event_id:event.event_id});}]]){const b=el('button',text,'quiet');b.onclick=fn;row.append(b);}card.append(row);return card;
+}
+function emptyRecords(){if(!$('records').children.length)$('records').append(el('p','该页没有记录，或本机尚未缓存。','subtle'));}
+function optimisticRecords(effects){
+  if(!recordsVisible())return;
+  const box=$('records');for(const {after:event}of effects){
+    recordsOptimistic.set(event.event_id,{event,year:recordsYear,offset:recordOffset,revision:snap.local.revision});
+    const card=[...box.children].find(n=>n.dataset.eventId===event.event_id);
+    if(event.deleted||C.eventYear(event)!==recordsYear){if(card)card.remove();continue;}
+    if(card)card.replaceWith(recordCard(event));
+    else {for(const child of [...box.children])if(!child.dataset.eventId)child.remove();box.prepend(recordCard(event));if(box.children.length>100)box.lastElementChild.remove();}
+  }emptyRecords();
+}
+function scheduleRecordsReconcile(){
+  clearTimeout(recordsReconcileTimer);recordsReconcileTimer=setTimeout(()=>paintRecords().catch(failed),500);
+}
 async function paintRecords(){
   if(!recordsYear||!recordsVisible())return;
-  const year=recordsYear,offset=recordOffset,generation=++recordsPaintGeneration,s=await D.snapshot(),meta=await D.get('cache','records:'+year);
+  const year=recordsYear,offset=recordOffset,generation=++recordsPaintGeneration;
+  const meta=await D.get('cache','records:'+year),events=await D.getEventsByIds(meta?.pages[offset]?.ids||[]),s=await D.getStatsState();
   if(year!==recordsYear||offset!==recordOffset||!recordsVisible()||generation!==recordsPaintGeneration)return;
-  const events=TimeUX.recordsView(s,year,offset,meta);
-  $('records').replaceChildren();
-  for(const event of events){const card=el('div',undefined,'record');card.append(el('strong',event.event_name+' · '+C.duration(event.duration_seconds)),el('p',new Date(event.start_at).toLocaleString('zh-CN',{timeZone:event.timezone})+' → '+new Date(event.end_at).toLocaleString('zh-CN',{timeZone:event.timezone}), 'subtle'));if(event.note)card.append(el('p',event.note,'subtle'));
-    const row=el('div',undefined,'row');for(const [text,fn]of [['修改',()=>openEditor(event)],['拆分',()=>openSplitter(event)],['删除',()=>{if(confirm('删除这条记录？统计将同步扣除。Drive 原始表保留删除标记。'))act({type:'delete',year:C.eventYear(event),event_id:event.event_id});}]]){const b=el('button',text,'quiet');b.onclick=fn;row.append(b);}card.append(row);$('records').append(card);}
-
-  if(!events.length)$('records').append(el('p','该页没有记录，或本机尚未缓存。','subtle'));
-  const localCount=s.events.filter(e=>!e.deleted&&C.eventYear(e)===year).length;
-  recordNext=meta?.complete?(localCount>offset+100?offset+100:null):meta?.pages[offset]?meta.pages[offset].next:(localCount>offset+100?offset+100:null);
+  const projected=TimeUX.recordsView({...s,events},year,offset,meta),byId=new Map(projected.map(e=>[e.event_id,e]));
+  for(const [id,entry]of recordsOptimistic){if(meta&&meta.cloud_revision>=entry.revision){recordsOptimistic.delete(id);continue;}if(entry.year!==year||entry.offset!==offset)continue;
+    if(entry.event.deleted||C.eventYear(entry.event)!==year)byId.delete(id);else byId.set(id,entry.event);
+  }
+  const visible=[...byId.values()].sort((a,b)=>C.time(b.start_at)-C.time(a.start_at)||a.event_id.localeCompare(b.event_id)).slice(0,100);
+  $('records').replaceChildren(...visible.map(recordCard));emptyRecords();
+  recordNext=meta?.pages[offset]?.next??null;
   $('more-records').hidden=recordNext===null;$('previous-records').hidden=offset===0;
   $('record-page').textContent='第 '+(Math.floor(offset/100)+1)+' 页'+(meta?.complete?' · 全年已缓存':' · 已显示本机缓存');
 }
@@ -159,12 +190,12 @@ async function loadRecords(direction=false){
   notify('正在显示本机记录');await paintRecords();
   if(!navigator.onLine){notify('离线状态：记录已保存在本机，当前显示本机缓存','error');return;}
   if(!configured()||!T.ready()){googleLogin();return;}
-  const meta=await D.get('cache','records:'+year),s=await D.snapshot();
+  const meta=await D.get('cache','records:'+year),s=await D.getSyncState();
   if(!s.ops.length&&meta?.pages[offset]&&meta.cloud_revision>=(s.cloud?.revision??0)&&Date.now()-meta.fetched_at<30000){notify('记录已是最新（本机缓存）');return;}
   const key=year+':'+offset;
   if(!recordsFlights.has(key))recordsFlights.set(key,(async()=>{
     if(s.ops.length)await sync();
-    if((await D.snapshot()).ops.length)throw new Error('云端未确认，操作仍安全保存在本机');
+    if(await D.getQueueCount())throw new Error('云端未确认，操作仍安全保存在本机');
     if(generation===recordsGeneration)notify('正在检查云端更新…','loading','records');
     const current=await D.get('cache','records:'+year);
     const r=await send({action:'records',year,offset,cloud_revision:current?.cloud_revision,check_only:!!current?.pages[offset]});
@@ -192,10 +223,10 @@ async function restore(){
   if(!verified)throw new Error('先校验备份');if(!T.ready())throw new Error('请先登录');
   if(!confirm('将已校验记录导入云端。同 UUID 同内容会跳过，不同内容会拒绝。首次恢复请使用空库。继续？'))return;
   $('restore').disabled=true;
-  try{for(let i=0;i<verified.events.length;i+=5){await act({type:'import',events:verified.events.slice(i,i+5)});await sync();if((await D.snapshot()).ops.length)throw new Error('导入暂停，未确认批次已保留。恢复网络后同步，再重试导入（UUID 去重）。');$('restore-report').textContent=`已确认 ${Math.min(i+5,verified.events.length)} / ${verified.events.length}`;}notify('记录恢复完成，统计已重算');}finally{$('restore').disabled=false;}
+  try{for(let i=0;i<verified.events.length;i+=5){await act({type:'import',events:verified.events.slice(i,i+5)});await sync();if(await D.getQueueCount())throw new Error('导入暂停，未确认批次已保留。恢复网络后同步，再重试导入（UUID 去重）。');$('restore-report').textContent=`已确认 ${Math.min(i+5,verified.events.length)} / ${verified.events.length}`;}notify('记录恢复完成，统计已重算');}finally{$('restore').disabled=false;}
 }
 async function init(){
-  await D.open();settings=await D.get('cache','settings')||{};await repaint();$('backend-url').value=settings.backendUrl||'';$('client-id').value=settings.clientId||'';$('record-year').value=C.dateKey(Date.now(),snap.local.config.timezone).slice(0,4);selectors();renderConfig();await renderStats();
+  await D.open();settings=await D.get('cache','settings')||{};await repaint();$('backend-url').value=settings.backendUrl||'';$('client-id').value=settings.clientId||'';$('record-year').value=C.dateKey(Date.now(),snap.local.config.timezone).slice(0,4);selectors();renderConfig();await renderStats(false,false,true);
   if(!configured())$('settings').hidden=false;googleLogin();if(!navigator.onLine)notify('离线状态：记录已保存在本机','error');
   if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js').catch(err=>notify('离线页面缓存未就绪：'+err.message));
   if(navigator.storage?.estimate){const estimate=await navigator.storage.estimate();$('storage-info').textContent=`本机已用约 ${Math.ceil((estimate.usage||0)/1024/1024)} MB。浏览器持久存储：${await navigator.storage.persisted()?'已获准':'未获准'}`;}
