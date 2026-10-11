@@ -15,10 +15,13 @@
 也可直接双击 `启动本地预览.cmd`，并保持预览窗口开启。预览数据与手机正式部署数据相互独立。
 
 ```powershell
+pnpm install --frozen-lockfile --ignore-scripts
 node scripts/build.cjs
 node --test tests/*.test.cjs
 node scripts/serve.cjs
 ```
+
+首次运行测试需要安装开发依赖 fake-indexeddb（使用 pnpm；标准 Node/npm 环境也可用 `npm install --ignore-scripts`）。运行 PWA 和构建不需要该依赖。
 
 电脑浏览器打开 http://127.0.0.1:4173/ 。初次未连接云端时，可验证本地记录，页面清晰提示待同步数量。localhost 数据只存在这台电脑，手机安装必须使用 HTTPS 公网网址，不能把 localhost 当作部署结果。
 
@@ -30,6 +33,7 @@ node scripts/serve.cjs
 - [逐步部署和 OPPO 安装](docs/DEPLOYMENT.md)：点击位置、复制内容、账号配置。
 - [备份、恢复、迁移和故障处理](docs/OPERATIONS.md)：恢复完整数据与离线队列。
 - [测试报告与最终验收](docs/TESTING.md)：已验证和需实网验证的项目。
+- [2026-10-11 UX 与性能优化](docs/UX-PERFORMANCE.md)：批量同步、年度索引、缓存、性能对比、升级与手机验收。
 - `frontend/`：完整静态 PWA；仅此目录发布到 GitHub Pages。
 - `backend/`：Apps Script 源码和清单；`Core.gs` 由构建复制生成。
 - `tests/`：核心、服务端恢复与浏览器事务测试。

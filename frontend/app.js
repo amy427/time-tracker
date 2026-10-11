@@ -2,64 +2,44 @@
 'use strict';
 const $=id=>document.getElementById(id),C=TimeCore,D=TimeDB,T=TimeTransport;
 let snap,settings={},view='day',historyMode='month',historyValue='',subject='',busy=false,editEvent=null,splitEvent=null,verified=null,recordOffset=0,draftConfig,installPrompt;
-let googleIdentityInitialized=false;
-let serial=Promise.resolve(),syncTimer,retryMs=5000,flash='',flashUntil=0;
+let serial=Promise.resolve(),syncTimer,statsTimer,retryMs=5000,flash='',flashUntil=0,syncFlight=null;
+const toast=TimeUX.toast($('toast'));
+const identity=TimeUX.identity({getId:()=>google.accounts.id,transport:T,onCredential:()=>{notify('Google 登录成功');scheduleSync(100);},onFallback:()=>notify('登录已过期或未完成，请在设置中使用 Google 登录按钮','error')});
 function el(tag,text,className){const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(className)n.className=className;return n;}
-function notify(msg){flash=msg;flashUntil=Date.now()+7000;paintStatus();}
-function failed(err){notify(String(err.message||err));console.error(err);}
+function notify(msg,kind='success',key='notice'){flash=msg;flashUntil=Date.now()+7000;paintStatus();toast.show(msg,kind,key);}
+function failed(err){notify(String(err.message||err),'error');console.error(err);}
 function download(name,text,type='application/json'){const url=URL.createObjectURL(new Blob([text],{type})),a=el('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
 function paintStatus(){if(!snap)return;const count=snap.ops.length;let text=snap.conflict?'设备冲突 · 原队列已保留':!navigator.onLine?`离线 · ${count} 个操作待同步`:busy?`正在同步 · ${count} 个操作`:count?`${count} 个操作已保存到本机 · ${T.ready()?'等待同步':'请登录同步'}`:`${snap.cloud?'云端已确认':'本机已就绪'} · ${T.ready()?'已登录':'登录后自动同步'}`;if(flash&&Date.now()<flashUntil)text=flash+' · '+text;$('status').textContent=text;}
 function tick(){if(!snap)return;const cur=snap.local.current;$('elapsed').textContent=cur?(()=>{const s=Math.max(0,Math.floor((Date.now()-C.time(cur.start_at))/1000));return [Math.floor(s/3600),Math.floor(s%3600/60),s%60].map(v=>String(v).padStart(2,'0')).join(':');})():'00:00:00';paintStatus();}
 async function repaint(){snap=await D.snapshot();const cur=snap.local.current;$('current-name').textContent=cur?cur.event_name:'尚未开始';$('started').textContent=cur?'开始于 '+new Date(cur.start_at).toLocaleString('zh-CN',{timeZone:cur.timezone})+' · '+cur.timezone:'点一个活动，开始记录';$('stop').disabled=!cur||!!snap.conflict;$('conflict').hidden=!snap.conflict;
   const quick=$('quick');quick.replaceChildren();for(const def of snap.local.config.events){const b=el('button',def.name,cur&&cur.event_key===def.id?'active':'');b.disabled=!!snap.conflict;b.onclick=()=>act({type:'switch',at:new Date().toISOString(),event_id:crypto.randomUUID(),event_key:def.id});quick.append(b);}tick();
 }
-function act(spec){const task=serial.then(async()=>{const state=(await D.snapshot()).local;if(spec.type==='switch'&&state.current&&state.current.event_key===spec.event_key)return;if(spec.type==='stop'&&!state.current)return;await D.enqueue(spec);await repaint();notify('已保存到本机');announce();renderStats();scheduleSync(100);});serial=task.catch(failed);return task;}
+function act(spec){const task=serial.then(async()=>{const state=(await D.snapshot()).local;if(spec.type==='switch'&&state.current&&state.current.event_key===spec.event_key)return;if(spec.type==='stop'&&!state.current)return;await D.enqueue(spec);await repaint();await paintRecords();notify(({delete:'已删除，正在同步…（已保存到本机）',edit:'修改已保存到本机，正在同步…',split:'拆分已保存到本机，正在同步…'})[spec.type]||'已保存到本机');announce();renderStats(false,true);scheduleSync(300);});serial=task.catch(failed);return task;}
 const channel=typeof BroadcastChannel!=='undefined'?new BroadcastChannel('time-tracker-v1'):null;
 function announce(){if(channel)channel.postMessage('changed');}
 if(channel)channel.onmessage=()=>repaint().then(()=>renderStats()).catch(failed);
 function configured(){return /^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(settings.backendUrl||'')&&/^[A-Za-z0-9.-]+\.apps\.googleusercontent\.com$/.test(settings.clientId||'');}
 function scheduleSync(delay=retryMs){clearTimeout(syncTimer);syncTimer=setTimeout(()=>sync().catch(failed),delay);}
-async function send(payload){if(!configured())throw new Error('请先保存后端网址和 Google Client ID');const r=await T.call(settings,payload);if(!r.ok){if(r.code==='AUTH_REQUIRED'){T.credential('');throw new Error('AUTH_REQUIRED');}if(r.code==='CONFLICT'){await D.freeze(r.state);await repaint();throw new Error('设备冲突，队列已保留，请处理后继续');}throw new Error(r.message||'服务端暂时未确认');}return r;}
+async function send(payload){if(!configured())throw new Error('请先保存后端网址和 Google Client ID');const r=await T.call(settings,payload);if(!r.ok){if(r.code==='AUTH_REQUIRED'){identity.expired();googleLogin();throw new Error('登录已过期，请使用 Google 登录按钮重试');}if(payload.action==='sync_batch'&&Array.isArray(r.confirmed))return r;if(r.code==='CONFLICT'){await D.freeze(r.state);await repaint();throw new Error('设备冲突，队列已保留，请处理后继续');}throw new Error(r.message||'服务端暂时未确认');}return r;}
+function deferStats(){clearTimeout(statsTimer);statsTimer=setTimeout(()=>{if(busy)return deferStats();renderStats(true);},2000);}
 async function sync(){
-  if(busy||!navigator.onLine||!configured()||!T.ready())return;
-  const run=async()=>{busy=true;paintStatus();try{
+  if(syncFlight)return syncFlight;
+  if(!navigator.onLine||!configured())return;
+  if(!T.ready()){googleLogin();return;}
+  const run=async()=>{busy=true;clearTimeout(statsTimer);paintStatus();try{
     let s=await D.snapshot();if(s.conflict)return;
+    const types=new Set(s.ops.map(i=>i.op.type));notify(`正在同步 ${s.ops.length} 条记录`,'loading','sync');
     if(!s.ops.length){const r=await send({action:'state'});await D.remote(r.state);}
-    else while(s.ops.length){const next=s.ops[0];const r=await send({action:'sync',op:next.op});await D.accept(next.op_id,r.state);s=await D.snapshot();if(s.conflict)break;}
-    retryMs=5000;await repaint();announce();await renderStats(true);
-  }catch(err){retryMs=Math.min(300000,retryMs*2);failed(err);}finally{busy=false;paintStatus();if((await D.snapshot()).ops.length&&!snap.conflict&&T.ready()&&navigator.onLine)scheduleSync();}};
-  if(navigator.locks)await navigator.locks.request('time-tracker-sync',{ifAvailable:true},lock=>lock?run():scheduleSync(5000));else await run();
+    else while(s.ops.length){const batch=TimeUX.batch(s.ops);const r=await send({action:'sync_batch',ops:batch.map(i=>i.op)});await TimeUX.acceptResponse(D,batch,r);s=await D.snapshot();if(s.conflict)throw new Error('设备冲突');}
+    retryMs=5000;await repaint();announce();toast.clear('sync');notify(types.size===1?({delete:'删除已同步到云端',edit:'修改已同步',split:'拆分已同步'})[[...types][0]]||'同步完成':'同步完成');renderStats(false,true);deferStats();
+  }catch(err){retryMs=Math.min(300000,retryMs*2);await repaint();notify('云端未确认，操作仍安全保存在本机；记录已保存在本机。'+err.message,'error');}finally{busy=false;toast.clear('sync');paintStatus();if((await D.snapshot()).ops.length&&!snap.conflict&&T.ready()&&navigator.onLine)scheduleSync();}};
+  syncFlight=(navigator.locks?navigator.locks.request('time-tracker-sync',{ifAvailable:true},lock=>lock?run():scheduleSync(5000)):run()).finally(()=>{syncFlight=null;});return syncFlight;
 }
 function googleLogin(){
   if(!configured())return;
 
   const init=()=>{
-    if(!googleIdentityInitialized){
-      google.accounts.id.initialize({
-        client_id:settings.clientId,
-        callback:response=>{
-          T.credential(response.credential);
-          notify('登录成功');
-          sync().catch(failed);
-        },
-        auto_select:false,
-        use_fedcm_for_button:true,
-        nonce:crypto.randomUUID()
-      });
-
-      googleIdentityInitialized=true;
-    }
-
-    $('google-signin').replaceChildren();
-    google.accounts.id.renderButton(
-      $('google-signin'),
-      {
-        theme:'outline',
-        size:'large',
-        text:'signin_with',
-        locale:'zh_CN'
-      }
-    );
+    identity.start(settings.clientId,$('google-signin'));
   };
 
   if(globalThis.google?.accounts?.id)return init();
@@ -88,13 +68,13 @@ function selectors(){const box=$('selectors');box.replaceChildren();let mode=vie
 }
 function querySpec(){let mode=view==='history'?historyMode:view;const today=C.dateKey(Date.now(),snap.local.config.timezone);let value=(view==='history'||view==='month')?historyValue:'';if(!value)value=mode==='month'?today.slice(0,7):mode==='year'?today.slice(0,4):today;return {mode,value};}
 let statsGeneration=0;
-async function renderStats(refresh=false){
+async function renderStats(refresh=false,localOnly=false){
   if(!snap)return;const gen=++statsGeneration,q=querySpec();let r;
   try{
     const range=C.range(q.mode,q.value,snap.local.config.timezone),key='query:'+q.mode+':'+(q.mode==='all'?'all':range.from);
     r=await D.get('cache',key);
-    if(navigator.onLine&&T.ready()&&configured()&&(refresh||!r||Date.now()-r.fetched_at>30000)){
-      const response=await send({action:'query',...q});r={...response,fetched_at:Date.now()};await D.cache(key,r);
+    if(!localOnly&&!busy&&navigator.onLine&&T.ready()&&configured()&&(refresh||!r||Date.now()-r.fetched_at>30000)){
+      const response=await send({action:'query',...q});r=await D.cache(key,{...response,fetched_at:Date.now()});
     }
     const s=await D.snapshot();if(gen!==statsGeneration)return;
     let total=C.clone(r?.total||C.emptySummary('total')),days=new Map((r?.days||[]).map(d=>[d.date,C.clone(d)])),rev=r?.state.revision;
@@ -121,15 +101,45 @@ function inputInstant(value,tz){
   if(candidates.length>1){const choice=prompt('夏令时回拨产生两个相同本地时间。请复制选择一个 UTC 时间：\n'+candidates.join('\n'),candidates[0]);if(!candidates.includes(choice))throw new Error('未确认夏令时重叠时间');return choice;}
   return candidates[0];
 }
-async function loadRecords(more=false){
-  const year=String($('record-year').value);if(!/^\d{4}$/.test(year))throw new Error('请输入四位年份');
-  if(!more){recordOffset=0;$('records').replaceChildren();}
-  let events,next=null;
-  if(navigator.onLine&&T.ready()&&configured()){await sync();if((await D.snapshot()).ops.length)throw new Error('请先完成同步后修正历史');const r=await send({action:'records',year,offset:recordOffset});events=r.events;next=r.next;await D.remember(events);}
-  else {events=(await D.snapshot()).events.filter(e=>!e.deleted&&C.eventYear(e)===year).sort((a,b)=>b.start_at.localeCompare(a.start_at));if(more)events=[];notify('离线列表仅包含本机缓存');}
+let recordsYear='',recordNext=null,recordsGeneration=0;
+const recordsFlights=new Map();
+async function paintRecords(){
+  if(!recordsYear)return;
+  const year=recordsYear,offset=recordOffset,s=await D.snapshot(),meta=await D.get('cache','records:'+year);
+  if(year!==recordsYear||offset!==recordOffset)return;
+  const events=TimeUX.recordsView(s,year,offset,meta);
+  $('records').replaceChildren();
   for(const event of events){const card=el('div',undefined,'record');card.append(el('strong',event.event_name+' · '+C.duration(event.duration_seconds)),el('p',new Date(event.start_at).toLocaleString('zh-CN',{timeZone:event.timezone})+' → '+new Date(event.end_at).toLocaleString('zh-CN',{timeZone:event.timezone}), 'subtle'));if(event.note)card.append(el('p',event.note,'subtle'));
     const row=el('div',undefined,'row');for(const [text,fn]of [['修改',()=>openEditor(event)],['拆分',()=>openSplitter(event)],['删除',()=>{if(confirm('删除这条记录？统计将同步扣除。Drive 原始表保留删除标记。'))act({type:'delete',year:C.eventYear(event),event_id:event.event_id});}]]){const b=el('button',text,'quiet');b.onclick=fn;row.append(b);}card.append(row);$('records').append(card);}
-  if(!events.length&&!more)$('records').append(el('p','该归档没有记录，或本机尚未缓存。','subtle'));recordOffset=next;$('more-records').hidden=next===null;
+
+  if(!events.length)$('records').append(el('p','该页没有记录，或本机尚未缓存。','subtle'));
+  const localCount=s.events.filter(e=>!e.deleted&&C.eventYear(e)===year).length;
+  recordNext=meta?.complete?(localCount>offset+100?offset+100:null):meta?.pages[offset]?meta.pages[offset].next:(localCount>offset+100?offset+100:null);
+  $('more-records').hidden=recordNext===null;$('previous-records').hidden=offset===0;
+  $('record-page').textContent='第 '+(Math.floor(offset/100)+1)+' 页'+(meta?.complete?' · 全年已缓存':' · 已显示本机缓存');
+}
+async function loadRecords(direction=false){
+  const year=String($('record-year').value);if(!/^\d{4}$/.test(year))throw new Error('请输入四位年份');
+  if(year!==recordsYear||!direction)recordOffset=0;
+  else recordOffset=direction==='previous'?Math.max(0,recordOffset-100):recordNext??recordOffset;
+  recordsYear=year;const generation=++recordsGeneration,offset=recordOffset;toast.clear('records');
+  notify('正在显示本机记录');await paintRecords();
+  if(!navigator.onLine){notify('离线状态：记录已保存在本机，当前显示本机缓存','error');return;}
+  if(!configured()||!T.ready()){googleLogin();return;}
+  const meta=await D.get('cache','records:'+year),s=await D.snapshot();
+  if(!s.ops.length&&meta?.pages[offset]&&meta.cloud_revision>=(s.cloud?.revision??0)&&Date.now()-meta.fetched_at<30000){notify('记录已是最新（本机缓存）');return;}
+  const key=year+':'+offset;
+  if(!recordsFlights.has(key))recordsFlights.set(key,(async()=>{
+    if(s.ops.length)await sync();
+    if((await D.snapshot()).ops.length)throw new Error('云端未确认，操作仍安全保存在本机');
+    if(generation===recordsGeneration)notify('正在检查云端更新…','loading','records');
+    const current=await D.get('cache','records:'+year);
+    const r=await send({action:'records',year,offset,cloud_revision:current?.cloud_revision,check_only:!!current?.pages[offset]});
+    await D.rememberPage(year,r);return r;
+  })().finally(()=>recordsFlights.delete(key)));
+  try{const r=await recordsFlights.get(key);if(generation!==recordsGeneration)return;if(r.reset)recordOffset=0;await paintRecords();notify('记录已是最新');}
+  catch(err){if(generation===recordsGeneration)notify('云端未确认，记录已保存在本机。'+err.message,'error');}
+  finally{if(generation===recordsGeneration)toast.clear('records');}
 }
 function openEditor(event){editEvent=event;$('edit-start').value=localInput(event.start_at,event.timezone);$('edit-end').value=localInput(event.end_at,event.timezone);$('edit-name').value=event.event_name;$('edit-category').value=event.category;$('edit-note').value=event.note;$('edit-zone').textContent=event.timezone+'；开始年份改变会自动迁移归档。';$('editor').showModal();}
 function openSplitter(event){splitEvent=event;$('split-at').value=localInput(C.iso((C.time(event.start_at)+C.time(event.end_at))/2),event.timezone);$('split-key').replaceChildren();for(const def of snap.local.config.events){const o=el('option',def.name);o.value=def.id;$('split-key').append(o);}$('splitter').showModal();}
@@ -153,7 +163,7 @@ async function restore(){
 }
 async function init(){
   await D.open();settings=await D.get('cache','settings')||{};await repaint();$('backend-url').value=settings.backendUrl||'';$('client-id').value=settings.clientId||'';$('record-year').value=C.dateKey(Date.now(),snap.local.config.timezone).slice(0,4);selectors();renderConfig();await renderStats();
-  if(!configured())$('settings').hidden=false;googleLogin();
+  if(!configured())$('settings').hidden=false;googleLogin();if(!navigator.onLine)notify('离线状态：记录已保存在本机','error');
   if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js').catch(err=>notify('离线页面缓存未就绪：'+err.message));
   if(navigator.storage?.estimate){const estimate=await navigator.storage.estimate();$('storage-info').textContent=`本机已用约 ${Math.ceil((estimate.usage||0)/1024/1024)} MB。浏览器持久存储：${await navigator.storage.persisted()?'已获准':'未获准'}`;}
   setInterval(tick,1000);setInterval(()=>renderStats(),60000);
@@ -161,12 +171,12 @@ async function init(){
 $('stop').onclick=()=>act({type:'stop',at:new Date().toISOString()});
 $('settings-toggle').onclick=()=>{$('settings').hidden=!$('settings').hidden;if(!$('settings').hidden){renderConfig();googleLogin();$('settings').scrollIntoView({behavior:'smooth'});}};
 $('save-settings').onclick=async()=>{try{const proposed={backendUrl:$('backend-url').value.trim(),clientId:$('client-id').value.trim()},old=settings;settings=proposed;if(!configured()){settings=old;throw new Error('网址必须以 /exec 结尾，Client ID 必须是 Google 网页应用 ID');}await D.cache('settings',settings);T.credential('');googleLogin();notify('连接已保存，请登录');}catch(err){failed(err);}};
-$('sync').onclick=()=>T.ready()?sync().catch(failed):notify('请先使用 Google 按钮登录');
+$('sync').onclick=()=>{if(!T.ready()){$('settings').hidden=false;googleLogin();notify('正在尝试自动登录，也可使用 Google 登录按钮');}else sync().catch(failed);};
 $('persist').onclick=async()=>{try{notify(navigator.storage?.persist&&await navigator.storage.persist()?'浏览器已允许持久存储':'浏览器尚未允许；经常使用并安装 App 后可再试');}catch(err){failed(err);}};
 $('export-local').onclick=()=>exportLocal().catch(failed);$('export-conflict').onclick=$('export-local').onclick;
 $('use-cloud').onclick=async()=>{if(!confirm('采用云端状态并将本机未同步记录保存为冲突副本？建议先导出。'))return;try{await D.useCloud();await repaint();renderConfig();renderStats(true);announce();notify('已采用云端状态；冲突副本可从本地导出文件找回');}catch(err){failed(err);}};
 document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{view=b.dataset.tab;historyValue='';document.querySelectorAll('[data-tab]').forEach(x=>x.setAttribute('aria-pressed',String(x===b)));selectors();renderStats();});
-$('load-records').onclick=()=>loadRecords().catch(failed);$('more-records').onclick=()=>loadRecords(true).catch(failed);
+$('load-records').onclick=()=>loadRecords().catch(failed);$('more-records').onclick=()=>loadRecords(true).catch(failed);$('previous-records').onclick=()=>loadRecords('previous').catch(failed);document.querySelector('.history-records').addEventListener('toggle',e=>{if(e.target.open)loadRecords().catch(failed);});
 $('cancel-edit').onclick=()=>$('editor').close();$('cancel-split').onclick=()=>$('splitter').close();
 $('edit-form').onsubmit=async e=>{e.preventDefault();try{const patch={start_at:inputInstant($('edit-start').value,editEvent.timezone),end_at:inputInstant($('edit-end').value,editEvent.timezone),event_name:$('edit-name').value,category:$('edit-category').value,note:$('edit-note').value};await act({type:'edit',year:C.eventYear(editEvent),event_id:editEvent.event_id,patch});$('editor').close();}catch(err){failed(err);}};
 $('split-form').onsubmit=async e=>{e.preventDefault();try{await act({type:'split',year:C.eventYear(splitEvent),event_id:splitEvent.event_id,at:inputInstant($('split-at').value,splitEvent.timezone),event_key:$('split-key').value,new_event_id:crypto.randomUUID()});$('splitter').close();}catch(err){failed(err);}};
@@ -176,6 +186,6 @@ $('verify-backup').onclick=()=>verifyBackup().catch(err=>{$('restore-report').te
 $('restore-config').onclick=()=>verified&&act({type:'config',config:verified.metadata.config});
 $('restore-local').onclick=async()=>{try{const file=$('local-restore-file').files[0];if(!file)throw new Error('请选择本地恢复副本');const backup=JSON.parse(await file.text());if(!confirm('恢复这个副本中的原始队列、当前活动和本机记录？原 UUID 保留，连接设置保持当前值。'))return;await D.restoreLocal(backup);await repaint();renderConfig();selectors();renderStats();announce();notify('本地副本已恢复，请登录同步');scheduleSync(300);}catch(err){failed(err);}};
 $('restore-current').onclick=()=>{if(verified?.metadata.current&&confirm('从现在重新开始这个活动？备份时刻到现在的空缺不会自动记为持续活动。')){const c=verified.metadata.current;if(!snap.local.config.events.some(e=>e.id===c.event_key))return notify('请先恢复配置');act({type:'switch',event_key:c.event_key,event_id:crypto.randomUUID(),at:new Date().toISOString()});}};
-addEventListener('online',()=>{googleLogin();scheduleSync(200);renderStats();});addEventListener('offline',paintStatus);document.addEventListener('visibilitychange',()=>{if(!document.hidden){repaint().then(()=>renderStats()).catch(failed);scheduleSync(200);}});
+addEventListener('online',()=>{googleLogin();scheduleSync(200);renderStats();});addEventListener('offline',()=>{paintStatus();notify('离线状态：记录已保存在本机，联网后自动同步','error');});document.addEventListener('visibilitychange',()=>{if(!document.hidden){repaint().then(()=>renderStats()).catch(failed);scheduleSync(200);}});
 addEventListener('beforeinstallprompt',event=>{event.preventDefault();installPrompt=event;$('install').hidden=false;});$('install').onclick=async()=>{if(installPrompt){await installPrompt.prompt();installPrompt=null;$('install').hidden=true;}};
 init().catch(err=>{$('status').textContent='无法打开本地存储，未开始记录：'+err.message;document.querySelectorAll('#quick button,#stop').forEach(b=>b.disabled=true);});

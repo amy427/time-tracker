@@ -77,7 +77,7 @@ node scripts/check-backup.cjs "C:\你的备份目录\对应版本-manifest.json"
 
 1. 先 backupYear 保存现状，停止其他设备提交。
 2. 检查 event_id、ISO 8601、timezone、schema_version、整数 duration_seconds 全部合法。不要移动原始行到错误开始年份；跨年调整应使用 App 自动迁移。
-3. 在 Editor 建立 `function repair2026(){ rebuildYear(2026); }`，保存并运行。
+3. 在 Editor 建立 `function repair2026(){ rebuildYear(2026); rebuildRecordsIndex(2026); }`，保存并运行。后者重建新增的辅助记录索引，不改变原始表；详情见 [索引维护](UX-PERFORMANCE.md)。
 4. 若记录跨入下一年，还要重建 2027。重建会读取目标年和必要的前两年，包含最多 366 天跨界记录。
 5. 日汇总和年汇总使用持久化计划替换，重建重复运行不会加倍；版本会增加，让旧设备缓存触发刷新/冲突保护。
 6. 手动改表不是完整受审计的写入机制，可能破坏 UUID 索引；不要手工更换 UUID、开始年份或 deleted。

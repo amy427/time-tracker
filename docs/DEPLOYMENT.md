@@ -6,10 +6,13 @@
 
 1. 打开本项目目录 `time-tracker`。
 2. 地址栏输入 `powershell` 并回车，打开终端。
+   首次测试前运行 `pnpm install --frozen-lockfile --ignore-scripts` 安装测试依赖（标准 Node/npm 安装也可运行 `npm install --ignore-scripts`）。仅启动预览不需要依赖。
 3. 输入 `node scripts/build.cjs` 并回车。它生成 Core.gs、实际 PNG 安装图标、按内容版本化的 service worker。
 4. 输入 `node --test tests/*.test.cjs`。看到 fail 0 后继续。
 
 ## 2. 建立 GitHub 仓库并发布前端
+
+已有部署升级请先看 [UX 优化发布顺序](UX-PERFORMANCE.md)：先更新原后端部署，再更新前端，不需要新建 Drive 目录。
 
 1. 登录 https://github.com/ 。右上角“+”→“New repository”。
 2. Repository name 填 `time-tracker`，普通免费账号选择 Public。不要上传私人数据。

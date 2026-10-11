@@ -28,6 +28,7 @@ function verifyIdToken_(token){
 }
 function doGet(){return HtmlService.createHtmlOutput('<!doctype html><meta charset="utf-8"><p>时间记录后端已运行。请使用你的 PWA 前端登录。</p>');}
 function doPost(e){
+  resetExecution_();
   var payload,reply,origin=props_().getProperty('ALLOWED_ORIGIN'),nonce='';
   try{
     TimeCore.assert(e&&e.parameter&&typeof e.parameter.payload==='string'&&e.parameter.payload.length<100000,'请求无效');payload=JSON.parse(e.parameter.payload);nonce=payload.nonce;
@@ -35,6 +36,7 @@ function doPost(e){
     var lock=LockService.getScriptLock();lock.waitLock(20000);
     try{verifyIdToken_(payload.token);recover_();
       if(payload.action==='sync')reply=commit_(payload.op);
+      else if(payload.action==='sync_batch')reply=commitBatch_(payload.ops);
       else if(payload.action==='state')reply={ok:true,state:state_()};
       else if(payload.action==='query')reply=query_(payload);
       else if(payload.action==='records')reply=records_(payload);
