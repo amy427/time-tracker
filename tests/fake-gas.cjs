@@ -17,7 +17,7 @@ function environment(){
     DriveApp:{createFolder:n=>new Folder(n),getFolderById:id=>folders.get(id),getFileById:id=>files.get(id)},
     Utilities:{DigestAlgorithm:{SHA_256:'sha256'},Charset:{UTF_8:'utf8'},getUuid:()=>crypto.randomUUID(),computeDigest:(algo,text)=>signed(crypto.createHash(algo).update(text).digest()),newBlob:blob,base64DecodeWebSafe:s=>signed(Buffer.from(s,'base64url'))},
     CacheService:{getScriptCache:()=>({get:k=>cache.get(k)||null,put:(k,v)=>cache.set(k,v)})},
-    LockService:{getScriptLock:()=>({waitLock(){metrics.locks++;},releaseLock(){metrics.releases++;}})},
+    LockService:{getScriptLock:()=>({waitLock(){metrics.locks++;},tryLock(){metrics.locks++;return true;},releaseLock(){metrics.releases++;}})},
     ScriptApp:{getProjectTriggers:()=>triggers,newTrigger:name=>{const builder={timeBased:()=>builder,everyDays:()=>builder,atHour:()=>builder,inTimezone:()=>builder,create:()=>triggers.push({getHandlerFunction:()=>name})};return builder;}},
     HtmlService:{XFrameOptionsMode:{ALLOWALL:'ALLOWALL'},createHtmlOutput:html=>({html,setXFrameOptionsMode(){return this;}})},
     UrlFetchApp:{fetch:()=>({getResponseCode:()=>200,getContentText:()=>JSON.stringify({keys:context.jwks||[]})})}

@@ -8,7 +8,7 @@ function allRecords(g,year){let offset=0,events=[];do{const r=g.records_({year,o
 for(const n of [1,3,10])test(`${n} pending ops: one batch, ordered commits and UUID retransmission`,()=>{const {context:g}=environment(),ops=batch(n),r=g.commitBatch_(ops);assert.equal(r.ok,true);assert.deepEqual(clone(r.confirmed),ops.map(o=>o.op_id));assert.equal(r.state.revision,n);assert.equal(allRecords(g,'2026').length,n);const retry=g.commitBatch_(ops);assert.equal(retry.state.revision,n);assert.equal(allRecords(g,'2026').length,n);});
 test('middle revision conflict returns only confirmed prefix and failure position',()=>{const {context:g}=environment(),ops=batch(10);ops[4].base_revision=0;const r=g.commitBatch_(ops);assert.equal(r.code,'CONFLICT');assert.equal(r.failed_index,4);assert.equal(r.confirmed.length,4);assert.equal(r.state.revision,4);assert.equal(allRecords(g,'2026').length,4);});
 test('middle validation error does not execute later ops; retry after a lost reply deduplicates',()=>{const {context:g}=environment(),ops=batch(3);ops[1].type='invalid';let r=g.commitBatch_(ops);assert.equal(r.failed_index,1);assert.equal(r.confirmed.length,1);ops[1].type='import';r=g.commitBatch_(ops);assert.equal(r.ok,true);assert.equal(r.state.revision,3);assert.equal(allRecords(g,'2026').length,3);assert.throws(()=>g.commitBatch_(batch(11)));});
-test('doPost authenticates once, locks once, caches each workbook per execution',()=>{const env=environment(),g=env.context;let verified=0;g.verifyIdToken_=()=>{verified++;};const ops=batch(10);env.metrics.opens.length=0;const before=env.metrics.locks;
+test('doPost authenticates once, locks once, caches each workbook per execution',()=>{const env=environment(),g=env.context;let verified=0;g.verifyIdToken_=()=>{verified++;return "owner-sub";};const ops=batch(10);env.metrics.opens.length=0;const before=env.metrics.locks;
   const response=g.doPost({parameter:{payload:JSON.stringify({action:'sync_batch',ops,nonce:crypto.randomUUID(),origin:'https://owner.github.io',token:'test-only'})}});
   assert.match(response.html,/"ok":true/);assert.equal(verified,1);assert.equal(env.metrics.locks-before,1);assert.equal(new Set(env.metrics.opens).size,env.metrics.opens.length);
   const opens=env.metrics.opens.length;g.doPost({parameter:{payload:JSON.stringify({action:'state',nonce:crypto.randomUUID(),origin:'https://owner.github.io',token:'test-only'})}});assert.ok(env.metrics.opens.length>opens,'new execution must reopen workbook objects');
@@ -35,4 +35,34 @@ test('index repair can recover at every persisted write boundary without changin
 });
 test('batch interruptions at every persisted boundary recover and deduplicate the unconfirmed suffix',t=>{const ops=batch(3),sample=environment();sample.setFailure(Infinity);sample.context.commitBatch_(ops);const count=sample.writes;
   for(let fault=1;fault<=count;fault++){const env=environment(),g=env.context;env.setFailure(fault);const r=g.commitBatch_(ops);assert.deepEqual(clone(r.confirmed),ops.slice(0,r.confirmed.length).map(o=>o.op_id));env.clearFailure();g.resetExecution_();if(r.confirmed.length<3)assert.equal(g.commitBatch_(ops.slice(r.confirmed.length)).ok,true);assert.equal(g.state_().revision,3);assert.equal(allRecords(g,'2026').length,3);assert.equal(g.query_({mode:'all'}).total.total_seconds,90);assert.equal(g.pending_(),null);}t.diagnostic('Batch recovery checked at '+count+' persisted boundaries.');
+});
+
+test('busy lock returns retryable BUSY without recovery or writes; auth runs before acquisition',()=>{
+  const {context:g}=environment();let verified=0,attempts=0;g.verifyIdToken_=()=>{verified++;return 'owner-sub';};g.recover_=()=>{throw Error('must not recover without lock');};
+  g.LockService.getScriptLock=()=>({tryLock(ms){assert.equal(verified,1);assert.equal(ms,1000);attempts++;return false;},releaseLock(){throw Error('unowned lock');}});
+  const r=g.doPost({parameter:{payload:JSON.stringify({action:'state',token:'test',origin:'https://owner.github.io',nonce:crypto.randomUUID()})}});
+  assert.match(r.html,/"code":"BUSY"/);assert.match(r.html,/"retry_after_ms":15000/);assert.equal(attempts,1);
+});
+
+test('first-login owner is checked again inside lock and auth failure acquires no lock',()=>{
+  const {context:g,properties}=environment();let attempts=0;g.verifyIdToken_=()=>{throw Error('AUTH_REQUIRED');};g.LockService.getScriptLock=()=>({tryLock(){attempts++;properties.set('OWNER_SUB','other');return true;},releaseLock(){}});
+  const payload={action:'state',token:'test',origin:'https://owner.github.io',nonce:crypto.randomUUID()};assert.match(g.doPost({parameter:{payload:JSON.stringify(payload)}}).html,/AUTH_REQUIRED/);assert.equal(attempts,0);
+  g.verifyIdToken_=()=> 'owner';assert.match(g.doPost({parameter:{payload:JSON.stringify(payload)}}).html,/无权访问/);assert.equal(properties.get('OWNER_SUB'),'other');
+});
+
+test('batch time budget yields only between commits and remainder can resume without duplicates',()=>{
+  const {context:g}=environment(),ops=batch(3),r=g.commitBatch_(ops,1);assert.equal(r.code,'YIELD');assert.equal(r.failed_index,1);assert.deepEqual(clone(r.confirmed),[ops[0].op_id]);assert.equal(r.state.revision,1);
+  const rest=g.commitBatch_(ops);assert.equal(rest.ok,true);assert.equal(rest.state.revision,3);assert.equal(allRecords(g,'2026').length,3);assert.equal(g.pending_(),null);
+});
+
+test('maintenance uploads immutable backup files without holding ScriptLock',()=>{
+  const {context:g}=environment();let held=false;g.LockService.getScriptLock=()=>({tryLock(){assert.equal(held,false);held=true;return true;},releaseLock(){assert.equal(held,true);held=false;}});
+  const capture=g.captureBackup_,write=g.writeBackup_,publish=g.publishBackup_;let phases=[];
+  g.captureBackup_=p=>{assert.equal(held,true);phases.push('capture');return capture(p);};g.writeBackup_=s=>{assert.equal(held,false);phases.push('upload');return write(s);};g.publishBackup_=(s,w)=>{assert.equal(held,true);phases.push('publish');return publish(s,w);};
+  g.maintenance();assert.deepEqual(phases,['capture','upload','publish']);assert.equal(held,false);
+});
+
+test('backup captured before a concurrent commit cannot clear dirty flag or replace config',()=>{
+  const {context:g}=environment();g.commitBatch_(batch(1));const snapshot=g.captureBackup_('2026'),written=g.writeBackup_(snapshot);g.commitBatch_(batch(1,1));assert.equal(g.publishBackup_(snapshot,written),false);
+  const row=g.rows_(g.master_().getSheetByName('backup_index'),5).find(r=>r[0]==='2026');assert.equal(row[4],true);assert.equal(row[1],'');assert.equal(g.state_().revision,2);
 });

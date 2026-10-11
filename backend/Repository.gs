@@ -71,10 +71,11 @@ function applyPlan_(p){
   setPending_(null);
 }
 function recover_(){var p=pending_();if(p)applyPlan_(p);}
-function commitBatch_(ops){
+function commitBatch_(ops,deadline){
   TimeCore.assert(Array.isArray(ops)&&ops.length>0&&ops.length<=10,'每批必须包含 1 至 10 个操作');
   var confirmed=[],result;
   for(var i=0;i<ops.length;i++){
+    if(i>0&&deadline&&Date.now()>=deadline)return {ok:false,code:'YIELD',message:'本批已部分同步，稍后继续',confirmed:confirmed,state:result.state,failed_index:i,retry_after_ms:3000};
     try{result=commit_(ops[i]);}catch(err){return {ok:false,code:'ERROR',message:String(err.message||err),confirmed:confirmed,state:state_(),failed_index:i};}
     if(!result.ok)return {ok:false,code:result.code,message:result.message,confirmed:confirmed,state:result.state,failed_index:i};
     confirmed.push(ops[i].op_id);

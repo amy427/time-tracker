@@ -249,3 +249,20 @@ test('fresh old-year page cannot delete a confirmed cross-year cached event',asy
   await r.D.enqueue({type:'edit',year:'2026',event_id:e.event_id,patch:{start_at:'2027-01-02T00:00:00Z',end_at:'2027-01-02T00:00:30Z'}});await r.run('sync()');await r.D.rememberPage('2026',{events:[],offset:0,next:null,cloud_revision:2});
   assert.equal(C.eventYear((await r.D.getEventsByIds([e.event_id]))[0]),'2027');
 });
+
+test('cloud BUSY cooldown survives repeated taps and keeps durable queue',async()=>{
+  const r=await app(),at=await start408(r);let calls=0;r.g.TimeTransport.call=async()=>{calls++;return {ok:false,code:'BUSY',retry_after_ms:15000};};await r.run('sync()');assert.equal(calls,1);assert.equal(await r.D.getQueueCount(),2);assert.match(r.nodes.get('toast').textContent,/云端暂忙/);
+  r.g.spec=activity('english',at);await r.run('act(spec)');await r.run('sync()');await r.run('sync()');assert.equal(calls,1);assert.equal(await r.D.getQueueCount(),3);assert.equal(r.nodes.get('current-name').textContent,'英语');
+  assert.ok(r.run('cloudRetryAt-Date.now()')>=14000);
+});
+
+test('sync and stats requests share one network flight; expired transport pauses retry',async()=>{
+  const r=await app(),gate=deferred(),started=deferred();let active=0,max=0,calls=0;r.g.TimeTransport.call=async()=>{active++;max=Math.max(max,active);calls++;if(calls===1){started.resolve();await gate.promise;}active--;return {ok:true};};
+  const first=r.run("send({action:'state'})");await started.promise;const second=r.run("send({action:'query',mode:'all'})");await settle();assert.equal(calls,1);gate.resolve();await Promise.all([first,second]);assert.equal(max,1);assert.equal(calls,2);
+  r.g.TimeTransport.call=async()=>{throw Error('网络请求超时；待同步记录已保留');};await assert.rejects(r.run("send({action:'state'})"));assert.ok(r.run('cloudRetryAt-Date.now()')>=59000);
+});
+
+test('YIELD confirms only committed prefix and retains rest for later sync',async()=>{
+  const r=await app();for(let i=0;i<3;i++)await r.D.enqueue({type:'import',events:[event(i)]});r.g.TimeTransport.call=async(_,p)=>clone(r.env.context.commitBatch_(p.ops,1));await r.run('sync()');assert.equal(await r.D.getQueueCount(),2);assert.equal((await r.D.getSyncState()).cloud.revision,1);assert.equal((await r.D.getLocalState()).revision,3);
+  r.run('cloudRetryAt=0');r.g.TimeTransport.call=async(_,p)=>clone(r.env.context.commitBatch_(p.ops));await r.run('sync()');assert.equal(await r.D.getQueueCount(),0);assert.equal(r.env.context.state_().revision,3);
+});

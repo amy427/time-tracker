@@ -2,6 +2,7 @@
 'use strict';
 const $=id=>document.getElementById(id),C=TimeCore,D=TimeDB,T=TimeTransport;
 let snap,settings={},view='day',historyMode='month',historyValue='',subject='',busy=false,editEvent=null,splitEvent=null,verified=null,recordOffset=0,draftConfig,installPrompt;
+let cloudSerial=Promise.resolve(),cloudRetryAt=0;
 let serial=Promise.resolve(),syncTimer,statsTimer,retryMs=5000,flash='',flashUntil=0,syncFlight=null;
 let uiGeneration=0,paintRequest=0,localStatsTimer;
 const toast=TimeUX.toast($('toast'));
@@ -51,12 +52,26 @@ const channel=typeof BroadcastChannel!=='undefined'?new BroadcastChannel('time-t
 function announce(){if(channel)channel.postMessage('changed');}
 if(channel)channel.onmessage=()=>repaint().then(()=>renderStats()).catch(failed);
 function configured(){return /^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(settings.backendUrl||'')&&/^[A-Za-z0-9.-]+\.apps\.googleusercontent\.com$/.test(settings.clientId||'');}
-function scheduleSync(delay=retryMs){clearTimeout(syncTimer);syncTimer=setTimeout(()=>sync().catch(failed),delay);}
-async function send(payload){if(!configured())throw new Error('请先保存后端网址和 Google Client ID');const r=await T.call(settings,payload);if(!r.ok){if(r.code==='AUTH_REQUIRED'){identity.expired();googleLogin();throw new Error('登录已过期，请使用 Google 登录按钮重试');}if(payload.action==='sync_batch'&&Array.isArray(r.confirmed))return r;if(r.code==='CONFLICT'){await D.freeze(r.state);await repaint();throw new Error('设备冲突，队列已保留，请处理后继续');}throw new Error(r.message||'服务端暂时未确认');}return r;}
+function scheduleSync(delay=retryMs){clearTimeout(syncTimer);syncTimer=setTimeout(()=>sync().catch(failed),Math.max(delay,cloudRetryAt-Date.now()));}
+function cloudPause(ms=15000){cloudRetryAt=Math.max(cloudRetryAt,Date.now()+ms+Math.floor(Math.random()*3000));}
+function send(payload){const flight=cloudSerial.then(()=>sendOne(payload));cloudSerial=flight.catch(()=>{});return flight;}
+async function sendOne(payload){
+  if(Date.now()<cloudRetryAt)throw Object.assign(new Error('云端暂忙，稍后自动重试'),{code:'BUSY'});
+  if(!configured())throw new Error('请先保存后端网址和 Google Client ID');
+  let r;try{r=await T.call(settings,payload);}catch(err){if(err.code==='NETWORK_TIMEOUT'||/网络请求超时/.test(err.message)){cloudPause(60000);err.code='NETWORK_TIMEOUT';}throw err;}
+  if(!r.ok){
+    if(r.code==='BUSY'||/Lock timeout/i.test(r.message||'')){cloudPause(Math.max(15000,Math.min(300000,Number(r.retry_after_ms)||15000)));throw Object.assign(new Error('云端暂忙，记录已保存在本机，稍后自动重试。'),{code:'BUSY'});}
+    if(r.code==='AUTH_REQUIRED'){identity.expired();googleLogin();throw new Error('登录已过期，请使用 Google 登录按钮重试');}
+    if(payload.action==='sync_batch'&&Array.isArray(r.confirmed)){if(r.code==='YIELD')cloudPause(3000);return r;}
+    if(r.code==='CONFLICT'){await D.freeze(r.state);await repaint();throw new Error('设备冲突，队列已保留，请处理后继续');}
+    throw new Error(r.message||'服务端暂时未确认');
+  }return r;
+}
 function deferStats(){clearTimeout(statsTimer);statsTimer=setTimeout(()=>{if(busy)return deferStats();renderStats(true);},2000);}
 async function sync(){
   if(syncFlight)return syncFlight;
   if(!navigator.onLine||!configured())return;
+  if(Date.now()<cloudRetryAt){scheduleSync(cloudRetryAt-Date.now());return;}
   if(!T.ready()){googleLogin();return;}
   const run=async()=>{busy=true;clearTimeout(statsTimer);paintStatus();try{
     let s=await D.getSyncState();if(s.conflict)return;
@@ -64,7 +79,7 @@ async function sync(){
     if(!s.ops.length){const r=await send({action:'state'});await D.remote(r.state);}
     else while(s.ops.length){const batch=TimeUX.batch(s.ops);const r=await send({action:'sync_batch',ops:batch.map(i=>i.op)});await TimeUX.acceptResponse(D,batch,r);s=await D.getSyncState();if(s.conflict)throw new Error('设备冲突');}
     retryMs=5000;await refreshCurrent();announce();toast.clear('sync');notify(types.size===1?({delete:'删除已同步到云端',edit:'修改已同步',split:'拆分已同步'})[[...types][0]]||'同步完成':'同步完成');deferLocalStats();deferStats();
-  }catch(err){retryMs=Math.min(300000,retryMs*2);await refreshCurrent();notify('云端未确认，操作仍安全保存在本机；记录已保存在本机。'+err.message,'error');}finally{busy=false;toast.clear('sync');paintStatus();if(await D.getQueueCount()&&!snap.conflict&&T.ready()&&navigator.onLine)scheduleSync();}};
+  }catch(err){retryMs=Math.min(300000,retryMs*2);await refreshCurrent();notify(['BUSY','YIELD'].includes(err.code)?'云端暂忙，记录已保存在本机，稍后自动重试。':'云端未确认，操作仍安全保存在本机；记录已保存在本机。'+err.message,['BUSY','YIELD'].includes(err.code)?'success':'error');}finally{busy=false;toast.clear('sync');paintStatus();if(await D.getQueueCount()&&!snap.conflict&&T.ready()&&navigator.onLine)scheduleSync();}};
   syncFlight=(navigator.locks?navigator.locks.request('time-tracker-sync',{ifAvailable:true},lock=>lock?run():scheduleSync(5000)):run()).finally(()=>{syncFlight=null;});return syncFlight;
 }
 function googleLogin(){

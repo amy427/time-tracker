@@ -8,7 +8,7 @@ function publicKeys_(refresh){
   if(!raw){var resp=UrlFetchApp.fetch('https://www.googleapis.com/oauth2/v3/certs',{muteHttpExceptions:true});if(resp.getResponseCode()!==200)throw new Error('Google 公钥暂时不可用，请稍后同步');raw=resp.getContentText();cache.put('google-jwks',raw,21600);}
   return JSON.parse(raw).keys;
 }
-function verifyIdToken_(token){
+function verifyIdToken_(token,bindOwner){
   TimeCore.assert(typeof token==='string'&&token.length<10000,'AUTH_REQUIRED');var chunks=token.split('.');TimeCore.assert(chunks.length===3,'AUTH_REQUIRED');
   var header=json64_(chunks[0]),claim=json64_(chunks[1]);TimeCore.assert(header.alg==='RS256'&&typeof header.kid==='string','AUTH_REQUIRED');
   var keys=publicKeys_(false),key=keys.find(function(k){return k.kid===header.kid;});if(!key)key=publicKeys_(true).find(function(k){return k.kid===header.kid;});
@@ -23,7 +23,7 @@ function verifyIdToken_(token){
   TimeCore.assert(claim.aud===settings.getProperty('GOOGLE_CLIENT_ID')&&(claim.iss==='https://accounts.google.com'||claim.iss==='accounts.google.com')&&Number.isFinite(claim.exp)&&claim.exp>now&&Number.isFinite(claim.iat)&&claim.iat<=now+60&&typeof claim.sub==='string'&&claim.sub.length>0,'AUTH_REQUIRED');
   var owner=settings.getProperty('OWNER_SUB');
   if(owner)TimeCore.assert(claim.sub===owner,'无权访问');
-  else {TimeCore.assert((claim.email_verified===true||claim.email_verified==='true')&&String(claim.email).toLowerCase()===String(settings.getProperty('OWNER_EMAIL')).toLowerCase(),'无权访问');settings.setProperty('OWNER_SUB',claim.sub);}
+  else {TimeCore.assert((claim.email_verified===true||claim.email_verified==='true')&&String(claim.email).toLowerCase()===String(settings.getProperty('OWNER_EMAIL')).toLowerCase(),'无权访问');if(bindOwner!==false)settings.setProperty('OWNER_SUB',claim.sub);}
   return claim.sub;
 }
 function doGet(){return HtmlService.createHtmlOutput('<!doctype html><meta charset="utf-8"><p>时间记录后端已运行。请使用你的 PWA 前端登录。</p>');}
@@ -33,16 +33,20 @@ function doPost(e){
   try{
     TimeCore.assert(e&&e.parameter&&typeof e.parameter.payload==='string'&&e.parameter.payload.length<100000,'请求无效');payload=JSON.parse(e.parameter.payload);nonce=payload.nonce;
     TimeCore.assert(TimeCore.uuid(nonce)&&payload.origin===origin,'来源无效');
-    var lock=LockService.getScriptLock();lock.waitLock(20000);
-    try{verifyIdToken_(payload.token);recover_();
+    // Signature/JWKS work must not hold the shared data lock. Recheck owner after
+    // acquisition, so simultaneous first logins cannot bind different subjects.
+    var subject=verifyIdToken_(payload.token,false),lock=LockService.getScriptLock();
+    if(!lock.tryLock(1000))throw new Error('CLOUD_BUSY');
+    var acquiredAt=Date.now();
+    try{var owner=props_().getProperty('OWNER_SUB');TimeCore.assert(!owner||owner===subject,'无权访问');if(!owner)props_().setProperty('OWNER_SUB',subject);recover_();
       if(payload.action==='sync')reply=commit_(payload.op);
-      else if(payload.action==='sync_batch')reply=commitBatch_(payload.ops);
+      else if(payload.action==='sync_batch')reply=commitBatch_(payload.ops,acquiredAt+20000);
       else if(payload.action==='state')reply={ok:true,state:state_()};
       else if(payload.action==='query')reply=query_(payload);
       else if(payload.action==='records')reply=records_(payload);
       else throw new Error('操作无效');
-    }finally{lock.releaseLock();}
-  }catch(err){var msg=String(err.message||err);reply={ok:false,code:msg==='AUTH_REQUIRED'?'AUTH_REQUIRED':'ERROR',message:msg};}
+    }finally{lock.releaseLock();console.log(JSON.stringify({action:payload.action,lock_ms:Date.now()-acquiredAt}));}
+  }catch(err){var msg=String(err.message||err),busy=msg==='CLOUD_BUSY'||/Lock timeout/i.test(msg);reply={ok:false,code:busy?'BUSY':msg==='AUTH_REQUIRED'?'AUTH_REQUIRED':'ERROR',message:busy?'云端暂忙，记录已保存在本机，稍后自动重试。':msg};if(busy)reply.retry_after_ms=15000;}
   var result={channel:'time-tracker-v1',nonce:nonce,reply:reply};
   // Escape HTML-breaking chars before placing JSON inside an inline script.
   var encoded=JSON.stringify(result).replace(/</g,'\\u003c').replace(/>/g,'\\u003e').replace(/&/g,'\\u0026').replace(/\u2028/g,'\\u2028').replace(/\u2029/g,'\\u2029');
