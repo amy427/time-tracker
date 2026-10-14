@@ -68,7 +68,7 @@ async function sendOne(payload){
     throw new Error(r.message||'服务端暂时未确认');
   }return r;
 }
-function deferStats(){clearTimeout(statsTimer);statsTimer=setTimeout(()=>{if(busy)return deferStats();renderStats(true);},2000);}
+function deferStats(){clearTimeout(statsTimer);if(document.hidden)return;statsTimer=setTimeout(()=>{if(busy)return deferStats();renderStats(true);},2000);}
 async function sync(){
   if(syncFlight)return syncFlight;
   if(!navigator.onLine||!configured())return;
@@ -80,11 +80,11 @@ async function sync(){
     if(!s.ops.length){const r=await send({action:'state'});await D.remote(r.state);}
     else while(s.ops.length){const batch=TimeUX.batch(s.ops);notify('正在同步 '+s.ops.length+' 条记录','loading','sync');const r=await send({action:'sync_batch',ops:batch.map(i=>i.op)});await TimeUX.acceptResponse(D,batch,r);s=await D.getSyncState();if(s.conflict)throw new Error('设备冲突');}
     retryMs=5000;await refreshCurrent();announce();toast.clear('sync');notify(types.size===1?({delete:'删除已同步到云端',edit:'修改已同步',split:'拆分已同步'})[[...types][0]]||'同步完成':'同步完成');deferLocalStats();deferStats();
-  }catch(err){retryMs=Math.min(300000,retryMs*2);await refreshCurrent();notify(['BUSY','YIELD'].includes(err.code)?'云端暂忙，记录已保存在本机，稍后自动重试。':'云端未确认，操作仍安全保存在本机；记录已保存在本机。'+err.message,['BUSY','YIELD'].includes(err.code)?'success':'error');}finally{busy=false;toast.clear('sync');paintStatus();if(await D.getQueueCount()&&!snap.conflict&&navigator.onLine){if(T.ready())scheduleSync();else if(!identity.needsInteraction())scheduleSync(Math.max(60000,retryMs));}}};
+  }catch(err){retryMs=err.code==='YIELD'&&err.confirmedCount>0?5000:Math.min(300000,retryMs*2);await refreshCurrent();notify(err.code==='YIELD'&&err.confirmedCount>0?'本批已同步，稍后自动继续剩余记录。':['BUSY','YIELD'].includes(err.code)?'云端暂忙，记录已保存在本机，稍后自动重试。':'云端未确认，操作仍安全保存在本机；记录已保存在本机。'+err.message,['BUSY','YIELD'].includes(err.code)?'success':'error');}finally{busy=false;toast.clear('sync');paintStatus();if(await D.getQueueCount()&&!snap.conflict&&navigator.onLine){if(T.ready())scheduleSync();else if(!identity.needsInteraction())scheduleSync(Math.max(60000,retryMs));}}};
   syncFlight=(navigator.locks?navigator.locks.request('time-tracker-sync',{ifAvailable:true},lock=>lock?run():scheduleSync(5000)):run()).finally(()=>{syncFlight=null;});return syncFlight;
 }
 function googleLogin(){
-  if(!configured()||!navigator.onLine)return;
+  if(!configured()||!navigator.onLine||document.hidden)return;
 
   const init=()=>{
     identity.start(settings.clientId,$('google-signin'));
@@ -126,7 +126,7 @@ async function recoverLocalStats(range,key,generation){
   return D.cache(key,{total,days:[...days.values()],range,state:latest.local,local_only:true,fetched_at:0});
 }
 async function renderStats(refresh=false,localOnly=false,allowLocalRecovery=false){
-  if(!snap)return;const gen=++statsGeneration,q=querySpec();let r;
+  if(!snap||document.hidden)return;const gen=++statsGeneration,q=querySpec();let r;
   try{
     const range=C.range(q.mode,q.value,snap.local.config.timezone),key='query:'+q.mode+':'+(q.mode==='all'?'all':range.from);
     r=await D.get('cache',key);
@@ -302,6 +302,24 @@ $('verify-backup').onclick=()=>verifyBackup().catch(err=>{$('restore-report').te
 $('restore-config').onclick=()=>verified&&act({type:'config',config:verified.metadata.config});
 $('restore-local').onclick=async()=>{try{const file=$('local-restore-file').files[0];if(!file)throw new Error('请选择本地恢复副本');const backup=JSON.parse(await file.text());if(!confirm('恢复这个副本中的原始队列、当前活动和本机记录？原 UUID 保留，连接设置保持当前值。'))return;await D.restoreLocal(backup);await repaint({allowReset:true});renderConfig();selectors();renderStats();announce();notify('本地副本已恢复，请登录同步');scheduleSync(300);}catch(err){failed(err);}};
 $('restore-current').onclick=()=>{if(verified?.metadata.current&&confirm('从现在重新开始这个活动？备份时刻到现在的空缺不会自动记为持续活动。')){const c=verified.metadata.current;if(!snap.local.config.events.some(e=>e.id===c.event_key))return notify('请先恢复配置');act({type:'switch',event_key:c.event_key,event_id:crypto.randomUUID(),at:new Date().toISOString()});}};
-addEventListener('online',()=>{googleLogin();scheduleSync(200);renderStats();});addEventListener('offline',()=>{paintStatus();notify('离线状态：记录已保存在本机，联网后自动同步','error');});document.addEventListener('visibilitychange',()=>{if(!document.hidden){repaint().then(()=>renderStats()).catch(failed);scheduleSync(200);}});
+// Best effort while the page is still runnable. A frozen/discarded page cannot
+// execute iframe transport; leave the durable queue untouched until it resumes.
+async function syncBeforeBackground(){
+  clearTimeout(statsTimer);clearTimeout(localStatsTimer);
+  await serial;
+  if(!navigator.onLine||!configured()||!T.ready()||snap?.conflict||!await D.getQueueCount())return;
+  clearTimeout(syncTimer);await sync(); // Existing single-flight and cloud cooldown still apply.
+}
+function resumeAutoSync(){
+  if(document.hidden)return;
+  repaint().then(()=>renderStats(false,true)).catch(failed);
+  scheduleSync(200); // Uploads take priority over fresh cloud statistics.
+}
+addEventListener('online',()=>{googleLogin();resumeAutoSync();if(document.hidden)syncBeforeBackground().catch(failed);});
+addEventListener('offline',()=>{paintStatus();notify('离线状态：记录已保存在本机，联网后自动同步','error');});
+document.addEventListener('visibilitychange',()=>{if(document.hidden)syncBeforeBackground().catch(failed);else resumeAutoSync();});
+document.addEventListener('resume',resumeAutoSync);
+addEventListener('pageshow',resumeAutoSync);
+
 addEventListener('beforeinstallprompt',event=>{event.preventDefault();installPrompt=event;$('install').hidden=false;});$('install').onclick=async()=>{if(installPrompt){await installPrompt.prompt();installPrompt=null;$('install').hidden=true;}};
 init().catch(err=>{$('status').textContent='无法打开本地存储，未开始记录：'+err.message;document.querySelectorAll('#quick button,#stop').forEach(b=>b.disabled=true);});

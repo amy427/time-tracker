@@ -34,7 +34,7 @@
     if(!Array.isArray(ids)||!r.state||ids.length>batch.length||ids.some((id,i)=>id!==batch[i].op_id)||
       (r.ok?ids.length!==batch.length:r.failed_index!==ids.length))throw new Error('批次回执无效；记录已保存在本机');
     await db.acceptBatch(ids,r.state);
-    if(!r.ok){if(r.code==='CONFLICT')await db.freeze(r.state);throw Object.assign(new Error(r.message||'云端未确认'),{code:r.code});}
+    if(!r.ok){if(r.code==='CONFLICT')await db.freeze(r.state);throw Object.assign(new Error(r.message||'云端未确认'),{code:r.code,confirmedCount:ids.length});}
   }
   function batch(ops){const result=[];let size=0;for(const item of ops.slice(0,10)){const length=JSON.stringify(item.op).length+1;if(result.length&&size+length>85000)break;result.push(item);size+=length;}return result;}
   function recordsView(s,year,offset,meta){

@@ -376,3 +376,40 @@ test('automatic sync status distinguishes local, offline, in-flight and cloud co
   r.g.navigator.onLine=false;r.run('paintStatus()');assert.match(r.nodes.get('status').textContent,/离线 · 联网后自动同步/);
   r.g.navigator.onLine=true;await r.run('sync()');r.run("flash='';paintStatus()");assert.equal(r.nodes.get('status').textContent,'云端已确认');
 });
+
+
+test('18 single-commit YIELD batches do not accumulate exponential failure backoff',async t=>{
+  const r=await app();for(let i=0;i<18;i++)await r.D.enqueue({type:'import',events:[event(i)]});
+  let now=Date.now(),wait=0,requests=0;r.g.Date=class extends Date{static now(){return now;}};
+  r.g.TimeTransport.call=async(_,p)=>{requests++;return clone(r.env.context.commitBatch_(p.ops,1));};
+  for(let remaining=17;remaining>=0;remaining--){await r.run('sync()');assert.equal(await r.D.getQueueCount(),remaining);assert.equal(r.run('retryMs'),5000);
+    if(remaining){const delay=r.clock.jobs.get(r.run('syncTimer')).at-r.clock.now();assert.ok(delay>=5000&&delay<=6000);wait+=delay;now+=delay+1;}
+  }
+  assert.equal(requests,18);assert.equal(r.env.context.state_().revision,18);assert.equal(r.env.context.query_({mode:'all'}).total.total_seconds,540);
+  let old=5000,oldWait=0;for(let i=0;i<17;i++){old=Math.min(300000,old*2);oldWait+=old;}
+  t.diagnostic(`18 batches, 17 waits only (RPC and browser suspension excluded): old=${oldWait}ms, new=${wait}ms`);
+});
+
+test('invalid YIELD receipt does not reset failure backoff or acknowledge pending UUIDs',async()=>{
+  const r=await app();await r.D.enqueue({type:'import',events:[event()]});const s=await r.D.getSyncState();r.run('retryMs=40000');
+  r.g.TimeTransport.call=async()=>({ok:false,code:'YIELD',confirmed:[crypto.randomUUID()],failed_index:1,state:s.local});await r.run('sync()');assert.equal(r.run('retryMs'),80000);assert.equal(await r.D.getQueueCount(),1);
+});
+
+test('background transition flushes queued input without waiting for its sync timer; no stats query',async()=>{
+  const r=await app();r.g.spec={type:'import',events:[event()]};const saved=r.run('act(spec)');r.g.document.hidden=true;
+  await r.run('syncBeforeBackground()');await saved;assert.equal(await r.D.getQueueCount(),0);assert.deepEqual(r.calls.map(p=>p.action),['sync_batch']);
+  await r.run('renderStats(true)');assert.equal(r.calls.length,1);
+});
+
+test('background sync shares in-flight request, respects BUSY, and preserves offline queue',async()=>{
+  const r=await app();await r.D.enqueue({type:'import',events:[event()]});let release,started;const begin=new Promise(resolve=>started=resolve),send=r.g.TimeTransport.call;
+  r.g.TimeTransport.call=(...args)=>new Promise(resolve=>{release=()=>resolve(send(...args));started();});const syncing=r.run('sync()');await begin;r.g.document.hidden=true;
+  const background=r.run('syncBeforeBackground()');release();await Promise.all([syncing,background]);assert.equal(r.calls.length,1);
+  await r.D.enqueue({type:'import',events:[event(1)]});r.run('cloudRetryAt=Date.now()+60000');await r.run('syncBeforeBackground()');assert.equal(r.calls.length,1);assert.ok(r.clock.jobs.get(r.run('syncTimer')).at>=59000);
+  r.g.navigator.onLine=false;await r.run('syncBeforeBackground()');assert.equal(await r.D.getQueueCount(),1);
+});
+
+test('resume and pageshow rearm automatic sync without starting cloud stats first',async()=>{
+  const r=await app();await r.D.enqueue({type:'import',events:[event()]});r.g.document.hidden=false;r.dispatchDocument('resume');await fireSyncTimer(r);assert.equal(await r.D.getQueueCount(),0);
+  await r.D.enqueue({type:'import',events:[event(1)]});r.dispatchWindow('pageshow');await fireSyncTimer(r);assert.equal(await r.D.getQueueCount(),0);assert.deepEqual(r.calls.map(p=>p.action),['sync_batch','sync_batch']);
+});
