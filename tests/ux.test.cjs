@@ -4,7 +4,7 @@ const clone=v=>JSON.parse(JSON.stringify(v));
 function timers(){let now=0,next=0;const jobs=new Map();return {jobs,setTimeout(fn,ms){const id=++next;jobs.set(id,{fn,at:now+ms});return id;},clearTimeout(id){jobs.delete(id);},advance(ms){now+=ms;for(const [id,j]of [...jobs])if(j.at<=now){jobs.delete(id);j.fn();}},now:()=>now};}
 class Node{constructor(tag='div'){this.tagName=tag;this.children=[];this.dataset={};this.style={};this.hidden=false;this.value='';this.textContent='';this.attrs={};}append(...v){for(const n of v)n.parent=this;this.children.push(...v);}prepend(...v){for(const n of v)n.parent=this;this.children.unshift(...v);}replaceChildren(...v){this.children=[];this.append(...v);}remove(){if(this.parent)this.parent.children=this.parent.children.filter(n=>n!==this);}replaceWith(n){const p=this.parent;if(p){n.parent=p;p.children[p.children.indexOf(this)]=n;}}get lastElementChild(){return this.children.at(-1);}setAttribute(k,v){this.attrs[k]=v;}addEventListener(){}scrollIntoView(){}showModal(){this.open=true;}close(){this.open=false;}}
 function runtime(app=false,debug=false){const windowEvents=new Map(),documentEvents=new Map(),listen=(map,type,fn)=>{if(!map.has(type))map.set(type,[]);map.get(type).push(fn);};const clock=timers(),nodes=new Map(),detail=Object.assign(new Node(),{open:true}),g=vm.createContext({console,crypto,structuredClone,Map,Set,Date,Intl,TimeCore:C,IDBKeyRange,indexedDB:new IDBFactory(),atob:s=>Buffer.from(s,'base64').toString(),setTimeout:clock.setTimeout,clearTimeout:clock.clearTimeout,setInterval(){},addEventListener:(type,fn)=>listen(windowEvents,type,fn),navigator:{onLine:true},location:{origin:'https://owner.github.io',search:debug?'?debug=1':''},document:{getElementById:id=>{if(!nodes.has(id))nodes.set(id,new Node());return nodes.get(id);},createElement:t=>new Node(t),querySelector:s=>s==='.history-records'?detail:null,querySelectorAll:()=>[],addEventListener:(type,fn)=>listen(documentEvents,type,fn),head:new Node(),body:new Node()}});
-  for(const f of ['db.js','ux.js','transport.js'])vm.runInContext(fs.readFileSync('frontend/'+f,'utf8'),g,{filename:f});
+  for(const f of ['study.js','db.js','ux.js','transport.js'])vm.runInContext(fs.readFileSync('frontend/'+f,'utf8'),g,{filename:f});
   if(app){let source=fs.readFileSync('frontend/app.js','utf8');source=source.slice(0,source.lastIndexOf('init().catch'));g.TimeTransport.ready=()=>true;g.google={accounts:{id:{initialize(){},renderButton(){},prompt(){}}}};vm.runInContext(source,g,{filename:'app.js'});}
   return {g,clock,nodes,detail,dispatchWindow:type=>(windowEvents.get(type)||[]).forEach(fn=>fn({type})),dispatchDocument:type=>(documentEvents.get(type)||[]).forEach(fn=>fn({type})),run:s=>vm.runInContext(s,g)};
 }
@@ -413,3 +413,36 @@ test('resume and pageshow rearm automatic sync without starting cloud stats firs
   const r=await app();await r.D.enqueue({type:'import',events:[event()]});r.g.document.hidden=false;r.dispatchDocument('resume');await fireSyncTimer(r);assert.equal(await r.D.getQueueCount(),0);
   await r.D.enqueue({type:'import',events:[event(1)]});r.dispatchWindow('pageshow');await fireSyncTimer(r);assert.equal(await r.D.getQueueCount(),0);assert.deepEqual(r.calls.map(p=>p.action),['sync_batch','sync_batch']);
 });
+
+
+async function studyApp(){const r=await app();r.D.enableStudy();r.run('studyReady=true');await r.run('paintStudy()');return r;}
+test('study quick start and switching atomically save UUID-linked pending debrief without extra network',async()=>{
+ const r=await studyApp();r.g.navigator.onLine=false;const io=instrument(r.database);await r.run("startStudy('math')");io.restore();assert.equal(io.transactions.length,1);assert.ok(io.requests.every(q=>!q.method.startsWith('getAll')&&q.store!=='cache'));
+ const id=(await r.D.getCurrent()).event_id;await r.run("startStudy('math')");assert.equal(await r.D.getQueueCount(),1);assert.equal((await r.D.getCurrent()).event_id,id);
+ await r.run("act({type:'switch',event_key:'english',event_id:crypto.randomUUID(),at:new Date().toISOString()})");const sessions=await r.D.studyEntries();assert.equal(sessions.length,1);assert.equal(sessions[0].event.event_id,id);assert.equal(sessions[0].result,null);assert.equal(sessions[0].task.minutes,40);assert.equal(r.calls.length,0);
+ const ops=(await r.D.getSyncState()).ops;assert.ok(ops.every(x=>!('studyTask' in x.op)));assert.equal((await r.D.get('meta','study-settings')).active.event_id,(await r.D.getCurrent()).event_id);
+});
+test('study debrief survives reload and cloud acknowledgement, double settlement cannot change time',async()=>{
+ const r=await studyApp();await r.run("startStudy('math')");await r.run("act({type:'stop',at:new Date().toISOString()})");await r.D.open();let rows=await r.D.studyEntries();assert.equal(rows.length,1);
+ const result={attempted:3,correct:2,ids:'教材1.1-3',stage:'independent',next:'重做第三题'};
+ await r.D.settleStudy(rows[0].key,result);await assert.rejects(r.D.settleStudy(rows[0].key,result),/已结算/);assert.equal(await r.D.getQueueCount(),2);
+ await r.run('sync()');assert.equal(await r.D.getQueueCount(),0);rows=await r.D.studyEntries();assert.equal(rows[0].result.correct,2);assert.equal(r.env.context.state_().revision,2);
+});
+test('study invalid result is rejected; backup restores evidence without overwriting or adding time',async()=>{
+ const r=await studyApp();await r.run("startStudy('cs408')");await r.run("act({type:'stop',at:new Date().toISOString()})");const row=(await r.D.studyEntries())[0];
+ await assert.rejects(r.D.settleStudy(row.key,{attempted:1,correct:2,ids:'x',stage:'independent',next:''}),/正确/);
+ await assert.rejects(r.D.settleStudy(row.key,{attempted:1,correct:1,ids:'',stage:'nextday',next:''}),/题号/);
+ const b=clone(await r.D.studyBackup()),other=await studyApp();await other.D.restoreStudy(b);await other.D.restoreStudy(b);assert.equal((await other.D.studyEntries()).length,1);assert.equal(await other.D.getQueueCount(),0);assert.equal(await other.D.getCurrent(),null);
+});
+test('changing a task preserves active session snapshot; interruption and 8 minute restart retain prior evidence',async()=>{
+ const r=await studyApp();await r.run("startStudy('math')");const active=await r.D.get('meta','study-settings');await r.D.updateStudyTask('math',{title:'下一章节',goal:'独立做三题',minutes:25});assert.deepEqual(clone((await r.D.get('meta','study-settings')).active),clone(active.active));
+ await r.nodes.get('study-rescue').onclick();assert.equal(await r.D.getCurrent(),null);assert.equal((await r.D.studyEntries())[0].interrupted,true);
+ await r.run("startStudy('math',true)");assert.equal((await r.D.get('meta','study-settings')).active.task.minutes,8);assert.equal((await r.D.studyEntries()).length,1);
+});
+test('study atomic transaction abort cannot leave phantom session',async()=>{
+ const r=await studyApp();await r.run("startStudy('math')");const rev=(await r.D.getLocalState()).revision;await assert.rejects(r.D.enqueue({type:'switch',event_key:'english',event_id:crypto.randomUUID(),at:new Date().toISOString(),studyTask:{title:'bad',goal:'',minutes:1}}));assert.equal((await r.D.getLocalState()).revision,rev);assert.equal((await r.D.studyEntries()).length,0);
+});
+
+test('study time-only settlement can be completed later without extra time operations',async()=>{const r=await studyApp();await r.run("startStudy('math')");await r.run("act({type:'stop',at:new Date().toISOString()})");const key=(await r.D.studyEntries())[0].key;await r.D.settleStudy(key,{attempted:0,correct:0,ids:'',stage:'unverified',next:''});await r.D.settleStudy(key,{attempted:3,correct:2,ids:'1-3',stage:'independent',next:''});assert.equal(await r.D.getQueueCount(),2);assert.equal((await r.D.studyEntries())[0].result.stage,'independent');});
+test('timeline Monday-first dates cross month and daily slices split overnight events',async()=>{const r=await app();r.run("timelineDate='2026-11-01';paintWeek()");const days=r.nodes.get('timeline-week').children;assert.equal(days.length,7);assert.match(days[0].attrs['aria-label'],/2026-10-26/);assert.equal(days[6].attrs['aria-pressed'],'true');r.g.e={...event(),timezone:'Asia/Shanghai',start_at:'2026-10-31T15:00:00Z',end_at:'2026-10-31T17:00:00Z'};assert.equal(r.run("daySlice(e,'2026-10-31').seconds"),3600);assert.equal(r.run("daySlice(e,'2026-11-01').seconds"),3600);});
+test('initial pageshow before database open is safely ignored',()=>{const r=runtime(true);assert.doesNotThrow(()=>r.dispatchWindow('pageshow'));assert.equal(r.clock.jobs.size,0);});

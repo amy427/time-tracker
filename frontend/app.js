@@ -13,12 +13,12 @@ function failed(err){notify(String(err.message||err),'error');console.error(err)
 function download(name,text,type='application/json'){const url=URL.createObjectURL(new Blob([text],{type})),a=el('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
 function paintStatus(){if(!snap)return;const count=snap.queueCount;let text=snap.conflict?'设备冲突 · 原队列已保留':!navigator.onLine?`离线 · 联网后自动同步 · ${count} 个操作保存在本机`:busy?`已保存到本机 · 正在自动同步 · ${count} 个操作`:count?`已保存到本机 · ${!configured()?'请先配置云端连接':identity.needsInteraction()?'请确认 Google 身份后自动同步':!T.ready()?'正在尝试自动登录':Date.now()<cloudRetryAt?'云端暂忙，稍后自动重试':'正在自动同步'} · ${count} 个操作`:(snap.cloud?'云端已确认':'本机已就绪 · 登录后自动同步');if(flash&&Date.now()<flashUntil)text=flash+' · '+text;$('status').textContent=text;}
 
-function tick(){if(!snap)return;const cur=snap.local.current;$('elapsed').textContent=cur?(()=>{const s=Math.max(0,Math.floor((Date.now()-C.time(cur.start_at))/1000));return [Math.floor(s/3600),Math.floor(s%3600/60),s%60].map(v=>String(v).padStart(2,'0')).join(':');})():'00:00:00';paintStatus();}
+function tick(){if(!snap)return;const cur=snap.local.current;$('elapsed').textContent=cur?(()=>{const s=Math.max(0,Math.floor((Date.now()-C.time(cur.start_at))/1000));return [Math.floor(s/3600),Math.floor(s%3600/60),s%60].map(v=>String(v).padStart(2,'0')).join(':');})():'00:00:00';paintStatus();tickStudy();}
 function paintCurrent(state,{allowReset=false}={}){
   if(snap&&!allowReset&&state.revision<snap.local.revision)return false;
   ++uiGeneration;snap={...snap,local:state,queueCount:state.queueCount??snap?.queueCount??0};
   const cur=state.current;$('current-name').textContent=cur?cur.event_name:'尚未开始';$('started').textContent=cur?'开始于 '+new Date(cur.start_at).toLocaleString('zh-CN',{timeZone:cur.timezone})+' · '+cur.timezone:'点一个活动，开始记录';$('stop').disabled=!cur||!!snap.conflict;$('conflict').hidden=!snap.conflict;
-  for(const b of $('quick').children){b.className=cur?.event_key===b.dataset.eventKey?'active':'';b.disabled=!!snap.conflict;}tick();return true;
+  for(const b of $('quick').children){b.className=cur?.event_key===b.dataset.eventKey?'active':'';b.disabled=!!snap.conflict;}tick();scheduleStudyPaint();return true;
 }
 async function refreshCurrent(rebuild=false,{allowReset=false}={}){
   const generation=uiGeneration,request=++paintRequest,latest=await D.getOverview();
@@ -42,7 +42,7 @@ function act(spec){
     if(!fast&&recordsAffected(spec))optimisticRecords(state.effects||[]); // The transaction's committed post-image; no reread, even on no-op.
     if(!fast&&recordsAffected(spec))++recordsPaintGeneration;
     notify(({delete:'已删除，正在同步…（已保存到本机）',edit:'修改已保存到本机，正在同步…',split:'拆分已保存到本机，正在同步…'})[spec.type]||'已保存到本机');
-    announce();deferLocalStats();scheduleSync(300);return state;
+    announce();deferLocalStats();deferTimeline(state);scheduleSync(300);return state;
   });
   // Only persistence/current UI is serialized. History/summary/network never enter this chain.
   serial=committed.catch(err=>{failed(err);refreshCurrent().catch(failed);});
@@ -221,6 +221,91 @@ async function loadRecords(direction=false){
   catch(err){if(generation===recordsGeneration)notify('云端未确认，记录已保存在本机。'+err.message,'error');}
   finally{if(generation===recordsGeneration)toast.clear('records');}
 }
+let timelineDate='',timelineGeneration=0,timelineTimer,timelineRunning=null;
+let timelineEvents=new Map();
+function daySlice(event,date,now=Date.now()){
+  if(event.deleted)return null;
+  const start=C.time(event.start_at),end=event.end_at?C.time(event.end_at):Math.max(start,Math.min(now,start+C.MAX_SPAN));
+  const a=C.midnight(date,event.timezone),b=C.midnight(C.shiftDate(date,1),event.timezone),from=Math.max(start,a),to=Math.min(end,b);
+  return to>from?{event,from,to,seconds:Math.floor((to-from)/1000)}:null;
+}
+function paintWeek(){
+  $('timeline-date').value=timelineDate;
+  const monday=C.range('week',timelineDate,snap.local.config.timezone).from,today=C.dateKey(Date.now(),snap.local.config.timezone);
+  $('timeline-week').replaceChildren(...['一','二','三','四','五','六','日'].map((name,i)=>{
+    const date=C.shiftDate(monday,i),button=el('button',undefined,date===timelineDate?'selected':'');
+    button.setAttribute('aria-pressed',String(date===timelineDate));button.setAttribute('aria-label',date+' 星期'+name);
+    button.append(el('span','周'+name),el('strong',date.slice(5).replace('-','/')),el('small',date===today?'今天':' '));
+    button.onclick=()=>selectTimelineDate(date);return button;
+  }));
+}
+function paintTimeline(events,date){
+  const rows=events.map(e=>daySlice(e,date)).filter(Boolean).sort((a,b)=>a.from-b.from||a.event.event_id.localeCompare(b.event.event_id));
+  $('timeline-list').replaceChildren(...rows.map(({event,from,to,seconds})=>{
+    const row=el('div',undefined,'timeline-row'),times=el('div',undefined,'timeline-times'),clock=ms=>localInput(C.iso(ms),event.timezone).slice(11,16);
+    times.append(el('strong',clock(from)),el('span',event.end_at?clock(to):'进行中'));
+    const card=el('div',undefined,'timeline-card');card.append(el('span',event.event_name,'timeline-tag'),el('strong',C.duration(seconds)),el('p',event.category+' · '+event.timezone,'subtle'));
+    if(C.time(event.start_at)<from||event.end_at&&C.time(event.end_at)>to)card.append(el('p','跨天记录，仅显示当天部分','subtle'));
+    if(event.note)card.append(el('p',event.note,'subtle'));
+    if(event.end_at){const edit=el('button','修改','quiet');edit.onclick=()=>openEditor(event);card.append(edit);}
+    row.append(times,card);return row;
+  }));
+  if(!rows.length)$('timeline-list').append(el('p','当天暂无本机记录；云端可能还有未缓存的记录。','subtle'));
+}
+async function loadTimeline(refresh=false){
+  if(!timelineDate||document.hidden)return;
+  const date=timelineDate,generation=++timelineGeneration,current=()=>generation===timelineGeneration&&date===timelineDate;
+  const events=new Map();let cursor;
+  $('timeline-note').textContent='正在显示本机记录…';
+  // Explicit date browsing only: short readonly transactions let quick input interleave.
+  while(current()){const chunk=await D.getRecoveryChunk(cursor);if(!current())return;
+    for(const e of chunk.events)if(daySlice(e,date))events.set(e.event_id,e);
+    if(chunk.done)break;cursor=chunk.next;await new Promise(resolve=>setTimeout(resolve,0));
+  }
+  const display=async()=>{const state=await D.getStatsState();if(!current())return;
+    const projected=new Map(events);for(const item of state.ops)for(const effect of item.effects)projected.set(effect.after.event_id,effect.after);
+    if(state.local.current)projected.set(state.local.current.event_id,state.local.current);
+    timelineEvents=projected;timelineRunning=state.local.current?.event_id||null;paintTimeline([...projected.values()],date);
+  };
+  await display();if(!current())return;
+  $('timeline-note').textContent='已显示本机记录 · 离线缓存可能不完整';
+  if(!refresh||!navigator.onLine||!configured()||!T.ready())return;
+  if(busy||await D.getQueueCount()){if(current())$('timeline-note').textContent='已显示本机记录 · 先自动同步，完成后可检查云端记录';return;}
+  try{
+    // Original-year archives can contain a 366-day event crossing two New Years.
+    const y=Number(date.slice(0,4));
+    for(const year of [String(y),String(y-1),String(y-2)]){
+      let offset=0,revision,loaded=[];const key='timeline:'+date+':'+year;
+      do{if(!current())return;if(busy||await D.getQueueCount())throw new Error('正在同步本机操作，稍后再检查');
+        $('timeline-note').textContent='已显示本机记录 · 正在检查云端更新…';
+        const response=await send({action:'records',year,date,offset,cloud_revision:revision});
+        if(!current())return;if(response.reset){loaded=[];offset=0;}
+        const meta=await D.rememberPage(year,response,key);if(!meta||meta.cloud_revision!==response.cloud_revision)throw new Error('云端版本已更新，请重新检查');
+        revision=response.cloud_revision;loaded.push(...response.events);offset=response.next;
+      }while(offset!==null);
+      for(const [id,e]of events)if(C.eventYear(e)===year&&e.revision<=revision)events.delete(id);
+      for(const e of loaded)events.set(e.event_id,e);
+      await display();
+    }
+    if(current())$('timeline-note').textContent='当天云端记录已更新 · 跨天记录按各自记录时区显示';
+  }catch(err){if(current())$('timeline-note').textContent='本机记录仍可查看 · '+err.message;}
+}
+function selectTimelineDate(date){
+  try{C.shiftDate(date,0);timelineDate=date;paintWeek();loadTimeline(true).catch(failed);}catch(err){failed(err);}
+}
+function deferTimeline(state){
+  if(!timelineDate)return;++timelineGeneration;clearTimeout(timelineTimer);
+  if(timelineRunning)timelineEvents.delete(timelineRunning);
+  for(const effect of state.effects||[])timelineEvents.set(effect.after.event_id,effect.after);
+  timelineRunning=state.current?.event_id||null;if(state.current)timelineEvents.set(state.current.event_id,state.current);
+  timelineTimer=setTimeout(()=>{if(!document.hidden){paintTimeline([...timelineEvents.values()],timelineDate);$('timeline-note').textContent='已显示本机记录 · 最新操作已保存到本机';}},500);
+}
+
+$('timeline-prev').onclick=()=>selectTimelineDate(C.shiftDate(timelineDate,-7));
+$('timeline-next').onclick=()=>selectTimelineDate(C.shiftDate(timelineDate,7));
+$('timeline-today').onclick=()=>selectTimelineDate(C.dateKey(Date.now(),snap.local.config.timezone));
+$('timeline-date').onchange=()=>selectTimelineDate($('timeline-date').value);
+$('timeline-refresh').onclick=()=>loadTimeline(true).catch(failed);
 let manualConfig=null,manualSaving=false;
 function openManual(){
   if(manualSaving)return;
@@ -259,7 +344,7 @@ function openEditor(event){editEvent=event;$('edit-start').value=localInput(even
 function openSplitter(event){splitEvent=event;$('split-at').value=localInput(C.iso((C.time(event.start_at)+C.time(event.end_at))/2),event.timezone);$('split-key').replaceChildren();for(const def of snap.local.config.events){const o=el('option',def.name);o.value=def.id;$('split-key').append(o);}$('splitter').showModal();}
 function renderConfig(){draftConfig=C.clone(snap.local.config);$('timezone').value=draftConfig.timezone;paintConfig();}
 function paintConfig(){const box=$('config-events');box.replaceChildren();draftConfig.events.forEach((def,i)=>{const card=el('div',undefined,'config-item'),name=el('input'),category=el('input');name.value=def.name;name.setAttribute('aria-label','事件名称');category.value=def.category;category.setAttribute('aria-label','分类');name.oninput=()=>def.name=name.value;category.oninput=()=>def.category=category.value;card.append(name,category);const row=el('div',undefined,'row');for(const [text,action]of [['↑',()=>{if(i>0)[draftConfig.events[i-1],draftConfig.events[i]]=[draftConfig.events[i],draftConfig.events[i-1]];}],['↓',()=>{if(i<draftConfig.events.length-1)[draftConfig.events[i+1],draftConfig.events[i]]=[draftConfig.events[i],draftConfig.events[i+1]];}],['移除',()=>draftConfig.events.splice(i,1)]]){const b=el('button',text,'quiet');b.onclick=()=>{action();paintConfig();};row.append(b);}card.append(row);box.append(card);});}
-async function exportLocal(){const s=await D.snapshot(),conflicts=await D.all('conflicts');download('time-tracker-local-'+new Date().toISOString().slice(0,10)+'.json',JSON.stringify({schema_version:1,kind:'local-recovery',generated_at:new Date().toISOString(),...s,conflicts},null,2));notify('本地副本已导出');}
+async function exportLocal(){const s=await D.snapshot(),conflicts=await D.all('conflicts');download('time-tracker-local-'+new Date().toISOString().slice(0,10)+'.json',JSON.stringify({schema_version:1,kind:'local-recovery',generated_at:new Date().toISOString(),...s,conflicts,study:await D.studyBackup()},null,2));notify('本地副本已导出');}
 async function sha(text){const bytes=new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(text)));return [...bytes].map(b=>b.toString(16).padStart(2,'0')).join('');}
 async function verifyBackup(){
   verified=null;$('restore').disabled=true;$('restore-config').disabled=true;$('restore-current').disabled=true;
@@ -276,12 +361,57 @@ async function restore(){
   try{for(let i=0;i<verified.events.length;i+=5){await act({type:'import',events:verified.events.slice(i,i+5)});await sync();if(await D.getQueueCount())throw new Error('导入暂停，未确认批次已保留。恢复网络后同步，再重试导入（UUID 去重）。');$('restore-report').textContent=`已确认 ${Math.min(i+5,verified.events.length)} / ${verified.events.length}`;}notify('记录恢复完成，统计已重算');}finally{$('restore').disabled=false;}
 }
 async function init(){
-  await D.open();settings=await D.get('cache','settings')||{};await repaint();$('backend-url').value=settings.backendUrl||'';$('client-id').value=settings.clientId||'';$('record-year').value=C.dateKey(Date.now(),snap.local.config.timezone).slice(0,4);selectors();renderConfig();await renderStats(false,false,true);
+  await D.open();D.enableStudy();studyReady=true;settings=await D.get('cache','settings')||{};await repaint();$('backend-url').value=settings.backendUrl||'';$('client-id').value=settings.clientId||'';$('record-year').value=C.dateKey(Date.now(),snap.local.config.timezone).slice(0,4);selectors();renderConfig();timelineDate=C.dateKey(Date.now(),snap.local.config.timezone);paintWeek();loadTimeline(false).catch(failed);await renderStats(false,false,true);
   if(!configured())$('settings').hidden=false;googleLogin();scheduleSync(200);if(!navigator.onLine)notify('离线状态：记录已保存在本机','error');
   if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js').catch(err=>notify('离线页面缓存未就绪：'+err.message));
   if(navigator.storage?.estimate){const estimate=await navigator.storage.estimate();$('storage-info').textContent=`本机已用约 ${Math.ceil((estimate.usage||0)/1024/1024)} MB。浏览器持久存储：${await navigator.storage.persisted()?'已获准':'未获准'}`;}
   setInterval(tick,1000);setInterval(()=>renderStats(),60000);
 }
+let studyReady=false,studyPaintTimer,studyPaintGeneration=0,studySettings=TimeStudy.defaults(),studySelected=null,studySaving=false,studyLastSubject='math',studyDisplayLimit=30;
+function scheduleStudyPaint(){if(!studyReady)return;clearTimeout(studyPaintTimer);studyPaintTimer=setTimeout(()=>paintStudy().catch(failed),100);}
+async function paintStudy(){
+  const generation=++studyPaintGeneration,settings=await D.get('meta','study-settings')||TimeStudy.defaults(),sessions=await D.studyEntries(studyDisplayLimit);
+  if(generation!==studyPaintGeneration)return;studySettings=settings;
+  const box=$('study-tasks');box.replaceChildren();
+  for(const key of ['math','cs408','english']){const task=settings.tasks[key]||TimeStudy.defaults().tasks[key],card=el('div',undefined,'study-task');card.append(el('span',key==='english'?'长期保持':'第一主线','eyebrow'),el('h3',task.title),el('p',task.goal,'subtle'));const button=el('button','一键进局 · '+task.minutes+' 分钟');button.disabled=!!snap?.conflict;button.onclick=()=>startStudy(key).catch(failed);card.append(button);box.append(card);}
+  const pending=sessions.filter(s=>!s.result||s.result.stage==='unverified');$('study-report-label').textContent='学习战报 · 最近 '+sessions.length+' 局 / '+pending.length+' 局待结算';
+  const verified=sessions.filter(s=>s.result&&s.result.stage!=='unverified'),attempted=verified.reduce((n,s)=>n+s.result.attempted,0),correct=verified.reduce((n,s)=>n+s.result.correct,0);
+  $('study-more').hidden=sessions.length<studyDisplayLimit;
+  $('study-summary').textContent='最近已验收局独立正确率：'+(attempted?Math.round(correct/attempted*100)+'%（'+correct+'/'+attempted+'）':'暂无证据')+' · 时长不等于掌握程度';
+  $('study-sessions').replaceChildren(...sessions.map(session=>{const row=el('div',undefined,'record');row.append(el('strong',session.task.title),el('p',new Date(session.event.start_at).toLocaleString('zh-CN',{timeZone:session.event.timezone})+' · 撤离时记录 '+C.duration(session.event.duration_seconds),'subtle'));
+    if(session.result){row.append(el('p',({unverified:'未验收',understood:'已理解',independent:'独立做对',nextday:'隔天复测通过',weekly:'周混合测试通过'})[session.result.stage]+' · '+session.result.correct+'/'+session.result.attempted),el('p',session.result.ids||'未登记题号','subtle'));if(session.result.next)row.append(el('p','下一步：'+session.result.next));}
+    if(!session.result||session.result.stage==='unverified'){const button=el('button','补成果 · 时间已记录','quiet');button.onclick=()=>openStudyResult(session);row.append(button);}return row;}));
+  tickStudy();
+}
+function tickStudy(){
+  if(!studyReady||!snap)return;const cur=snap.local.current,active=studySettings.active;
+  $('study-active').hidden=!cur||!TimeStudy.subjects.includes(cur.event_key);
+  if($('study-active').hidden)return;studyLastSubject=cur.event_key;
+  const task=active?.event_id===cur.event_id?active.task:studySettings.tasks[cur.event_key]||TimeStudy.defaults().tasks[cur.event_key];
+  $('study-active-title').textContent=task.title;$('study-active-goal').textContent=task.goal;
+  const remaining=Math.ceil((C.time(cur.start_at)+task.minutes*60000-Date.now())/1000);
+  $('study-remaining').textContent=remaining>0?'建议剩余 '+Math.floor(remaining/60)+' 分 '+remaining%60+' 秒':'已到建议撤离时间 · 可以结束本局，不必硬撑';
+}
+async function startStudy(key,small=false){
+  if(!snap.local.config.events.some(e=>e.id===key))throw new Error('请先在设置中恢复该科目的快捷活动');
+  const task=small?{title:'保底局 · 只做第一步',goal:'用 8 分钟写出一道题的已知条件和第一步；不会也可以撤离',minutes:8}:studySettings.tasks[key]||TimeStudy.defaults().tasks[key];
+  if(small&&snap.local.current)await act({type:'stop',at:new Date().toISOString()});
+  await act({type:'switch',event_key:key,event_id:crypto.randomUUID(),at:new Date().toISOString(),studyTask:task});
+  notify('已进局，TimeLog 已开始记录；无需另外点击计时');
+}
+function openStudyResult(session){studySelected=session;$('study-result-title').textContent=session.task.title+' · '+C.duration(session.event.duration_seconds);$('study-attempted').value=String(session.result?.attempted||0);$('study-correct').value=String(session.result?.correct||0);$('study-ids').value=session.result?.ids||'';$('study-next').value=session.result?.next||'';$('study-stage').value=session.result?.stage||'unverified';$('study-result-error').textContent='';$('study-result-dialog').showModal();}
+$('study-result-form').onsubmit=async e=>{e.preventDefault();if(studySaving)return;studySaving=true;$('study-result-save').disabled=true;try{await D.settleStudy(studySelected.key,{attempted:Number($('study-attempted').value),correct:Number($('study-correct').value),ids:$('study-ids').value.trim(),stage:$('study-stage').value,next:$('study-next').value.trim()});$('study-result-dialog').close();scheduleStudyPaint();notify('学习成果已保存到本机；没有重复记录时间');}catch(err){$('study-result-error').textContent=err.message;}finally{studySaving=false;$('study-result-save').disabled=false;}};
+$('study-later').onclick=()=>$('study-result-dialog').close();
+$('study-exit').onclick=()=>act({type:'stop',at:new Date().toISOString()});
+$('study-rescue').onclick=async()=>{try{await act({type:'stop',at:new Date().toISOString(),studyTask:{rescue:true}});notify('已暂停学习计时，已有成果保留。准备好后可点击任务重新进入。');}catch(err){failed(err);}};
+$('study-small').onclick=()=>startStudy(studyLastSubject,true).catch(failed);
+function fillStudyTask(){const t=studySettings.tasks[$('study-subject').value]||TimeStudy.defaults().tasks[$('study-subject').value];$('study-title').value=t.title;$('study-goal').value=t.goal;$('study-minutes').value=String(t.minutes);}
+$('study-config').onclick=()=>{fillStudyTask();$('study-task-error').textContent='';$('study-task-dialog').showModal();};$('study-subject').value='math';$('study-subject').onchange=fillStudyTask;
+$('study-task-cancel').onclick=()=>$('study-task-dialog').close();
+$('study-task-form').onsubmit=async e=>{e.preventDefault();try{const task={title:$('study-title').value.trim(),goal:$('study-goal').value.trim(),minutes:Number($('study-minutes').value)};TimeStudy.validateTask(task);await D.updateStudyTask($('study-subject').value,task);$('study-task-dialog').close();await paintStudy();notify('任务已保存，下一局开始使用');}catch(err){$('study-task-error').textContent=err.message;}};
+$('study-import').onchange=async()=>{try{const file=$('study-import').files[0];if(!file)return;await D.restoreStudy(JSON.parse(await file.text()));await paintStudy();notify('学习成果已恢复，已有同 UUID 学习局保持不变');}catch(err){failed(err);}};
+$('study-more').onclick=()=>{studyDisplayLimit+=30;paintStudy().catch(failed);};
+$('study-export').onclick=async()=>{try{download('study-results-'+new Date().toISOString().slice(0,10)+'.json',JSON.stringify(await D.studyBackup(),null,2));}catch(err){failed(err);}};
 $('manual-start').oninput=previewManual;$('manual-end').oninput=previewManual;
 $('add-manual').onclick=openManual;$('cancel-manual').onclick=()=>$('manual').close();$('manual-form').onsubmit=saveManual;
 $('stop').onclick=()=>act({type:'stop',at:new Date().toISOString()});
@@ -305,13 +435,14 @@ $('restore-current').onclick=()=>{if(verified?.metadata.current&&confirm('从现
 // Best effort while the page is still runnable. A frozen/discarded page cannot
 // execute iframe transport; leave the durable queue untouched until it resumes.
 async function syncBeforeBackground(){
+  if(!snap)return;
   clearTimeout(statsTimer);clearTimeout(localStatsTimer);
   await serial;
   if(!navigator.onLine||!configured()||!T.ready()||snap?.conflict||!await D.getQueueCount())return;
   clearTimeout(syncTimer);await sync(); // Existing single-flight and cloud cooldown still apply.
 }
 function resumeAutoSync(){
-  if(document.hidden)return;
+  if(document.hidden||!snap)return;
   repaint().then(()=>renderStats(false,true)).catch(failed);
   scheduleSync(200); // Uploads take priority over fresh cloud statistics.
 }

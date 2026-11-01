@@ -1,6 +1,6 @@
 /* IndexedDB is the source of truth for local activity and unsent operations. */
 (function(root){
-  'use strict'; let db;
+  'use strict'; let db,studyEnabled=false;
   const debugEnabled=/(?:^|[?&])debug=1(?:&|$)/.test(root.location?.search||'');let traceSequence=0;
   function debug(stage,data={}){if(debugEnabled)console.debug('[TimeDB]',{stage,at:Date.now(),...data});}
   function transaction(stores,mode='readonly',label=''){
@@ -68,10 +68,10 @@
   function enqueue(spec){debug('enqueue called',{type:spec.type});return new Promise((resolve,reject)=>{
     const tx=transaction(['meta','ops','events'],'readwrite','enqueue'),m=tx.objectStore('meta'),o=tx.objectStore('ops'),e=tx.objectStore('events');
     const ids=[...new Set([spec.event_id,spec.new_event_id,...(spec.events||[]).map(e=>e.event_id)].filter(Boolean))];
-    const reads=[m.get('local'),m.get('device'),m.get('conflict'),o.index('seq').openKeyCursor(null,'prev'),o.count(),...ids.map(id=>e.get(id))];let n=0,result;
+    const reads=[m.get('local'),m.get('device'),m.get('conflict'),o.index('seq').openKeyCursor(null,'prev'),o.count(),...ids.map(id=>e.get(id)),...(studyEnabled?[m.get('study-settings')]:[])];let n=0,result;
     const values=[];reads.forEach((r,i)=>r.onsuccess=()=>{values[i]=r.result;if(++n!==reads.length)return;
       try{
-        const s={local:values[0]||initial(),device:values[1]||crypto.randomUUID(),conflict:values[2],events:values.slice(5).filter(Boolean),m,o,e};
+        const s={local:values[0]||initial(),device:values[1]||crypto.randomUUID(),conflict:values[2],events:values.slice(5,5+ids.length).filter(Boolean),study:studyEnabled?(values[5+ids.length]||TimeStudy.defaults()):null,m,o,e};
         if(s.conflict)throw new Error('请先处理设备冲突，原离线记录已保留');
         const noOp=spec.type==='switch'&&s.local.current?.event_key===spec.event_key||spec.type==='stop'&&!s.local.current;
         const state=noOp?s.local:saveEnqueued(spec,s,(values[3]?.key||0)+1);
@@ -82,7 +82,8 @@
   });}
   function saveEnqueued(spec,s,seq){
     if(s.conflict)throw new Error('请先处理设备冲突，原离线记录已保留');
-    const op={...spec,op_id:crypto.randomUUID(),device_id:s.device,queued_at:new Date().toISOString(),base_revision:s.local.revision};
+    const {studyTask,...operationSpec}=spec;
+    const op={...operationSpec,op_id:crypto.randomUUID(),device_id:s.device,queued_at:new Date().toISOString(),base_revision:s.local.revision};
     const byId=new Map(s.events.map(e=>[e.event_id,e]));
     const repo={getEvent:(year,id)=>byId.get(id)||null,getDay:()=>null,getAnnual:()=>null};
     // Local plan only validates events; daily summary subtraction needs known preimages.
@@ -92,6 +93,7 @@
     repo.getDay=d=>dayMap[d]||null;repo.getAnnual=y=>annualMap[y]||null;
     const plan=TimeCore.planOperation(op,s.local,repo,Date.now());
     const effects=plan.writes.map(w=>{const before=byId.get(w.event.event_id)||null;byId.set(w.event.event_id,w.event);return {before,after:w.event};});
+    if(s.study&&(spec.type==='switch'||spec.type==='stop'))TimeStudy.capture(s,plan,spec);
     s.effects=effects;for(const w of plan.writes)s.e.put(w.event);
     s.o.put({op_id:op.op_id,seq,op,effects});s.m.put(plan.state,'local');s.m.put(s.device,'device');return plan.state;
   }
@@ -146,9 +148,9 @@
     const years=[...new Set(events.map(TimeCore.eventYear))];
     for(const year of years){const rows=events.filter(e=>TimeCore.eventYear(e)===year);for(let offset=0;offset<rows.length;offset+=100)await rememberPage(year,{events:rows.slice(offset,offset+100),offset,next:offset+100<rows.length?offset+100:null,cloud_revision:0,local_only:true});}
   }
-  async function rememberPage(year,response){const saved=await new Promise((resolve,reject)=>{
+  async function rememberPage(year,response,pageKey){const saved=await new Promise((resolve,reject)=>{
     // No events scan: protect pending preimages, write at most one incoming page.
-    const tx=transaction(['meta','ops','events','cache'],'readwrite'),m=tx.objectStore('meta'),o=tx.objectStore('ops'),e=tx.objectStore('events'),cache=tx.objectStore('cache'),key='records:'+year;
+    const tx=transaction(['meta','ops','events','cache'],'readwrite'),m=tx.objectStore('meta'),o=tx.objectStore('ops'),e=tx.objectStore('events'),cache=tx.objectStore('cache'),key=pageKey||'records:'+year;
     const reads=[m.get('cloud'),o.getAll(),cache.get(key)];let left=reads.length,result,stale=[];const values=[];
     reads.forEach((r,i)=>r.onsuccess=()=>{values[i]=r.result;if(--left)return;try{
       const [cloud,ops,old]=values;result=old;
@@ -179,8 +181,16 @@
   async function restoreLocal(backup){
     TimeCore.assert(backup?.schema_version===1&&backup.kind==='local-recovery','不是本地恢复副本');TimeCore.validateConfig(backup.local.config);TimeCore.assert(Number.isSafeInteger(backup.local.revision)&&Array.isArray(backup.ops)&&Array.isArray(backup.events),'副本结构无效');
     if(backup.local.current)TimeCore.validateEvent({...backup.local.current,end_at:backup.local.current.start_at});
+    if(backup.study)TimeStudy.validateBackup(backup.study);
     const events=backup.events.map(TimeCore.validateEvent),ids=new Set();for(const item of backup.ops){TimeCore.assert(TimeCore.uuid(item.op_id)&&item.op_id===item.op.op_id&&!ids.has(item.op_id)&&TimeCore.uuid(item.op.device_id)&&Number.isSafeInteger(item.op.base_revision),'队列校验失败');ids.add(item.op_id);}
-    return mutate(s=>{TimeCore.assert(!s.local.current&&!s.ops.length,'先结束活动并完成同步，再恢复本地副本');s.e.clear();for(const key of s.caches.keys())if(key.startsWith('records:')||key.startsWith('query:'))s.cacheStore.delete(key);for(const e of events)s.e.put(e);for(const item of backup.ops)s.o.put(item);s.m.put(backup.local,'local');if(backup.cloud)s.m.put(backup.cloud,'cloud');else s.m.delete('cloud');s.m.put(TimeCore.uuid(backup.device)?backup.device:crypto.randomUUID(),'device');if(backup.conflict)s.m.put(backup.conflict,'conflict');else s.m.delete('conflict');for(const branch of backup.conflicts||[])s.c.put(branch);},{conflicts:true});
+    return mutate(s=>{if(backup.study){for(const entry of backup.study.sessions){const {key,...session}=entry;const read=s.m.get(key);read.onsuccess=()=>{if(!read.result)s.m.put(session,key);};}s.m.put({...backup.study.settings,active:backup.study.settings.active?.event_id===backup.local.current?.event_id?backup.study.settings.active:null},'study-settings');}TimeCore.assert(!s.local.current&&!s.ops.length,'先结束活动并完成同步，再恢复本地副本');s.e.clear();for(const key of s.caches.keys())if(key.startsWith('records:')||key.startsWith('query:'))s.cacheStore.delete(key);for(const e of events)s.e.put(e);for(const item of backup.ops)s.o.put(item);s.m.put(backup.local,'local');if(backup.cloud)s.m.put(backup.cloud,'cloud');else s.m.delete('cloud');s.m.put(TimeCore.uuid(backup.device)?backup.device:crypto.randomUUID(),'device');if(backup.conflict)s.m.put(backup.conflict,'conflict');else s.m.delete('conflict');for(const branch of backup.conflicts||[])s.c.put(branch);},{conflicts:true});
   }
-  root.TimeDB={getRecoveryChunk,debug,getStatsState,getEventsByIds,open,get,all,snapshot,getOverview,getSyncState,getLocalState,getCurrent,getQueueCount,enqueue,accept,acceptBatch,acceptBatchCore,reconcileConfirmedCaches,remote,freeze,useCloud,cache,remember,rememberPage,restoreLocal};
+  function updateStudyTask(subject,task){TimeStudy.validateTask(task);if(!TimeStudy.subjects.includes(subject))throw new Error('无效科目');return new Promise((resolve,reject)=>{const tx=transaction('meta','readwrite'),m=tx.objectStore('meta'),r=m.get('study-settings');r.onsuccess=()=>{const settings=r.result||TimeStudy.defaults();settings.tasks[subject]=task;m.put(settings,'study-settings');};tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);});}
+  function restoreStudy(backup){TimeStudy.validateBackup(backup);return new Promise((resolve,reject)=>{const tx=transaction('meta','readwrite','study-restore'),m=tx.objectStore('meta');for(const entry of backup.sessions){const read=m.get(entry.key);read.onsuccess=()=>{if(!read.result){const {key,...session}=entry;m.put(session,key);}};}tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||new Error('学习备份恢复中断'));});}
+  function enableStudy(){studyEnabled=true;}
+  function studyWrite(key,value){return new Promise((resolve,reject)=>{const tx=transaction('meta','readwrite','study'),m=tx.objectStore('meta');m.put(value,key);tx.oncomplete=()=>resolve(value);tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||new Error('学习记录保存中断'));});}
+  function studyEntries(all=false){return new Promise((resolve,reject)=>{const tx=transaction('meta','readonly','study-list'),r=tx.objectStore('meta').openCursor(IDBKeyRange.bound('study-session:','study-session:\uffff'),'prev'),entries=[];r.onsuccess=()=>{const c=r.result;if(!c)return;entries.push({key:c.key,...c.value});if(all===true||entries.length<(typeof all==='number'?all:30))c.continue();};tx.oncomplete=()=>resolve(entries);tx.onerror=()=>reject(tx.error);});}
+  function settleStudy(key,result){return new Promise((resolve,reject)=>{const tx=transaction('meta','readwrite','study-settle'),m=tx.objectStore('meta'),r=m.get(key);let saved;r.onsuccess=()=>{try{if(!r.result)throw new Error('学习局不存在');if(r.result.result&&r.result.result.stage!=='unverified')throw new Error('这局已结算，不会重复计入');TimeStudy.validateResult(result);saved={...r.result,result:{...result,saved_at:new Date().toISOString()}};m.put(saved,key);}catch(err){reject(err);tx.abort();}};tx.oncomplete=()=>resolve(saved);tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||new Error('结算保存中断'));});}
+  async function studyBackup(){return {version:1,kind:'study-backup',settings:await get('meta','study-settings')||TimeStudy.defaults(),sessions:await studyEntries(true)};}
+  root.TimeDB={restoreStudy,updateStudyTask,enableStudy,studyWrite,studyEntries,settleStudy,studyBackup,getRecoveryChunk,debug,getStatsState,getEventsByIds,open,get,all,snapshot,getOverview,getSyncState,getLocalState,getCurrent,getQueueCount,enqueue,accept,acceptBatch,acceptBatchCore,reconcileConfirmedCaches,remote,freeze,useCloud,cache,remember,rememberPage,restoreLocal};
 })(globalThis);
