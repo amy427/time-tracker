@@ -363,17 +363,29 @@ async function restore(){
 async function init(){
   await D.open();D.enableStudy();studyReady=true;settings=await D.get('cache','settings')||{};await repaint();$('backend-url').value=settings.backendUrl||'';$('client-id').value=settings.clientId||'';$('record-year').value=C.dateKey(Date.now(),snap.local.config.timezone).slice(0,4);selectors();renderConfig();timelineDate=C.dateKey(Date.now(),snap.local.config.timezone);paintWeek();loadTimeline(false).catch(failed);await renderStats(false,false,true);
   if(!configured())$('settings').hidden=false;googleLogin();scheduleSync(200);if(!navigator.onLine)notify('离线状态：记录已保存在本机','error');
-  if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js').catch(err=>notify('离线页面缓存未就绪：'+err.message));
+  if('serviceWorker'in navigator){
+    navigator.serviceWorker.addEventListener('controllerchange',()=>{const button=$('app-update');button.hidden=false;button.textContent='新版已就绪 · 点击刷新';});
+    navigator.serviceWorker.register('./sw.js',{updateViaCache:'none'}).then(reg=>reg.update()).catch(err=>notify('离线页面缓存未就绪：'+err.message));
+  }
   if(navigator.storage?.estimate){const estimate=await navigator.storage.estimate();$('storage-info').textContent=`本机已用约 ${Math.ceil((estimate.usage||0)/1024/1024)} MB。浏览器持久存储：${await navigator.storage.persisted()?'已获准':'未获准'}`;}
   setInterval(tick,1000);setInterval(()=>renderStats(),60000);
 }
-let studyReady=false,studyPaintTimer,studyPaintGeneration=0,studySettings=TimeStudy.defaults(),studySelected=null,studySaving=false,studyLastSubject='math',studyDisplayLimit=30;
+let studyReady=false,studyPaintTimer,studyPaintGeneration=0,studySettings=TimeStudy.defaults(),studySelected=null,studySaving=false,studyLastSubject='math',studyDisplayLimit=30,studyMission=null;
 function scheduleStudyPaint(){if(!studyReady)return;clearTimeout(studyPaintTimer);studyPaintTimer=setTimeout(()=>paintStudy().catch(failed),100);}
 async function paintStudy(){
   const generation=++studyPaintGeneration,settings=await D.get('meta','study-settings')||TimeStudy.defaults(),sessions=await D.studyEntries(studyDisplayLimit);
   if(generation!==studyPaintGeneration)return;studySettings=settings;
   const box=$('study-tasks');box.replaceChildren();
-  for(const key of ['math','cs408','english']){const task=settings.tasks[key]||TimeStudy.defaults().tasks[key],card=el('div',undefined,'study-task');card.append(el('span',key==='english'?'长期保持':'第一主线','eyebrow'),el('h3',task.title),el('p',task.goal,'subtle'));const button=el('button','一键进局 · '+task.minutes+' 分钟');button.disabled=!!snap?.conflict;button.onclick=()=>startStudy(key).catch(failed);card.append(button);box.append(card);}
+  studyMission=TimeStudy.missionBoard(settings,sessions,Date.now(),snap?.local.config.timezone);
+  const mission=studyMission,card=el('div',undefined,'study-task recommended');
+  card.append(el('span',mission.mainDone?'今日主线已完成':'推荐下一局 · '+(mission.continued?'接着上次继续':'先把第一步做出来'),'eyebrow'),el('h3',mission.mainDone?'可以安心收工了':mission.task.title));
+  if(mission.mainDone)card.append(el('p','数学、408 的标准任务已自评完成。休息和游戏都不需要用熬夜换取。','subtle'));
+  else {card.append(el('p',mission.task.goal),el('p','保底：8 分钟，只尝试第一步。标准：完成上面的目标。挑战：有余力再做一道变式，不必加时。','subtle'));const start=el('button','一键进局 · '+mission.task.minutes+' 分钟');start.disabled=!!snap?.conflict;start.onclick=()=>startStudy(mission.key,false,mission.task).catch(failed);card.append(start);}
+  box.append(card);
+  const alternatives=el('details'),summary=el('summary','自主选择其他任务');alternatives.append(summary);
+  for(const key of ['math','cs408','english']){const task=settings.tasks[key]||TimeStudy.defaults().tasks[key],button=el('button',task.title+' · '+task.minutes+' 分钟','quiet');button.disabled=!!snap?.conflict;button.onclick=()=>startStudy(key).catch(failed);alternatives.append(button);}box.append(alternatives);
+  if(mission.review){const review=mission.review,button=el('button','待复测：'+review.task.title+' · '+review.result.ids,'quiet');button.onclick=()=>startStudy(review.event.event_key,false,{title:'隔天复测',goal:('闭卷重做：'+review.result.ids+'；结算时填写本次真实结果，保持相同题号以关联证据。').slice(0,300),minutes:15}).catch(failed);box.append(button);}
+  box.append(el('p','成长路线：已理解 → 独立做对 → 隔天复测 → 周混合测试。只记录真实证据，不靠时长升级。','subtle'));
   const pending=sessions.filter(s=>!s.result||s.result.stage==='unverified');$('study-report-label').textContent='学习战报 · 最近 '+sessions.length+' 局 / '+pending.length+' 局待结算';
   const verified=sessions.filter(s=>s.result&&s.result.stage!=='unverified'),attempted=verified.reduce((n,s)=>n+s.result.attempted,0),correct=verified.reduce((n,s)=>n+s.result.correct,0);
   $('study-more').hidden=sessions.length<studyDisplayLimit;
@@ -392,19 +404,19 @@ function tickStudy(){
   const remaining=Math.ceil((C.time(cur.start_at)+task.minutes*60000-Date.now())/1000);
   $('study-remaining').textContent=remaining>0?'建议剩余 '+Math.floor(remaining/60)+' 分 '+remaining%60+' 秒':'已到建议撤离时间 · 可以结束本局，不必硬撑';
 }
-async function startStudy(key,small=false){
+async function startStudy(key,small=false,override=null){
   if(!snap.local.config.events.some(e=>e.id===key))throw new Error('请先在设置中恢复该科目的快捷活动');
-  const task=small?{title:'保底局 · 只做第一步',goal:'用 8 分钟写出一道题的已知条件和第一步；不会也可以撤离',minutes:8}:studySettings.tasks[key]||TimeStudy.defaults().tasks[key];
+  const task=small?{title:'保底局 · 只做第一步',goal:'用 8 分钟写出一道题的已知条件和第一步；不会也可以撤离',minutes:8}:override||studySettings.tasks[key]||TimeStudy.defaults().tasks[key];
   if(small&&snap.local.current)await act({type:'stop',at:new Date().toISOString()});
   await act({type:'switch',event_key:key,event_id:crypto.randomUUID(),at:new Date().toISOString(),studyTask:task});
   notify('已进局，TimeLog 已开始记录；无需另外点击计时');
 }
-function openStudyResult(session){studySelected=session;$('study-result-title').textContent=session.task.title+' · '+C.duration(session.event.duration_seconds);$('study-attempted').value=String(session.result?.attempted||0);$('study-correct').value=String(session.result?.correct||0);$('study-ids').value=session.result?.ids||'';$('study-next').value=session.result?.next||'';$('study-stage').value=session.result?.stage||'unverified';$('study-result-error').textContent='';$('study-result-dialog').showModal();}
-$('study-result-form').onsubmit=async e=>{e.preventDefault();if(studySaving)return;studySaving=true;$('study-result-save').disabled=true;try{await D.settleStudy(studySelected.key,{attempted:Number($('study-attempted').value),correct:Number($('study-correct').value),ids:$('study-ids').value.trim(),stage:$('study-stage').value,next:$('study-next').value.trim()});$('study-result-dialog').close();scheduleStudyPaint();notify('学习成果已保存到本机；没有重复记录时间');}catch(err){$('study-result-error').textContent=err.message;}finally{studySaving=false;$('study-result-save').disabled=false;}};
+function openStudyResult(session){studySelected=session;$('study-result-title').textContent=session.task.title+' · '+C.duration(session.event.duration_seconds);$('study-attempted').value=String(session.result?.attempted||0);$('study-correct').value=String(session.result?.correct||0);$('study-ids').value=session.result?.ids||'';$('study-next').value=session.result?.next||'';$('study-stage').value=session.result?.stage||'unverified';$('study-completed').checked=!!session.result?.completed;$('study-result-error').textContent='';$('study-result-dialog').showModal();}
+$('study-result-form').onsubmit=async e=>{e.preventDefault();if(studySaving)return;studySaving=true;$('study-result-save').disabled=true;try{await D.settleStudy(studySelected.key,{completed:$('study-completed').checked,attempted:Number($('study-attempted').value),correct:Number($('study-correct').value),ids:$('study-ids').value.trim(),stage:$('study-stage').value,next:$('study-next').value.trim()});$('study-result-dialog').close();scheduleStudyPaint();notify('学习成果已保存到本机；没有重复记录时间');}catch(err){$('study-result-error').textContent=err.message;}finally{studySaving=false;$('study-result-save').disabled=false;}};
 $('study-later').onclick=()=>$('study-result-dialog').close();
-$('study-exit').onclick=()=>act({type:'stop',at:new Date().toISOString()});
+$('study-exit').onclick=async()=>{try{const id=snap.local.current?.event_id;await act({type:'stop',at:new Date().toISOString()});const sessions=await D.studyEntries(3),ended=sessions.find(s=>s.event.event_id===id);if(ended)openStudyResult(ended);}catch(err){failed(err);}};
 $('study-rescue').onclick=async()=>{try{await act({type:'stop',at:new Date().toISOString(),studyTask:{rescue:true}});notify('已暂停学习计时，已有成果保留。准备好后可点击任务重新进入。');}catch(err){failed(err);}};
-$('study-small').onclick=()=>startStudy(studyLastSubject,true).catch(failed);
+$('study-small').onclick=()=>startStudy(snap?.local.current?.event_key&&TimeStudy.subjects.includes(snap.local.current.event_key)?snap.local.current.event_key:studyMission?.key||studyLastSubject,true).catch(failed);
 function fillStudyTask(){const t=studySettings.tasks[$('study-subject').value]||TimeStudy.defaults().tasks[$('study-subject').value];$('study-title').value=t.title;$('study-goal').value=t.goal;$('study-minutes').value=String(t.minutes);}
 $('study-config').onclick=()=>{fillStudyTask();$('study-task-error').textContent='';$('study-task-dialog').showModal();};$('study-subject').value='math';$('study-subject').onchange=fillStudyTask;
 $('study-task-cancel').onclick=()=>$('study-task-dialog').close();
@@ -454,3 +466,5 @@ addEventListener('pageshow',resumeAutoSync);
 
 addEventListener('beforeinstallprompt',event=>{event.preventDefault();installPrompt=event;$('install').hidden=false;});$('install').onclick=async()=>{if(installPrompt){await installPrompt.prompt();installPrompt=null;$('install').hidden=true;}};
 init().catch(err=>{$('status').textContent='无法打开本地存储，未开始记录：'+err.message;document.querySelectorAll('#quick button,#stop').forEach(b=>b.disabled=true);});
+
+$('app-update').onclick=()=>location.reload();

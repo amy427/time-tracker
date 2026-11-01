@@ -18,10 +18,23 @@
   }
   function validateResult(r){
     if(!r||!Number.isInteger(r.attempted)||!Number.isInteger(r.correct)||r.attempted<0||r.attempted>100||r.correct<0||r.correct>r.attempted)throw new Error('独立正确题数应在 0 到尝试题数之间');
+    if(r&&r.completed!==undefined&&typeof r.completed!=='boolean')throw new Error('任务完成状态无效');
     if(!['unverified','understood','independent','nextday','weekly'].includes(r.stage))throw new Error('请选择验收阶段');
     if(typeof r.ids!=='string'||r.ids.length>300||typeof r.next!=='string'||r.next.length>300)throw new Error('题号和下一步最多 300 字');
     if(['independent','nextday','weekly'].includes(r.stage)&&(!r.ids.trim()||!r.correct))throw new Error('通过验收需填写具体题号和独立正确题数');
   }
   function validateBackup(b){if(b?.version!==1||b.kind!=='study-backup'||!Array.isArray(b.sessions)||b.sessions.length>100000)throw new Error('学习备份格式无效');for(const k of subjects)validateTask(b.settings?.tasks?.[k]);const keys=new Set();for(const entry of b.sessions){const e=TimeCore.validateEvent(entry.event);validateTask(entry.task);if(entry.result)validateResult(entry.result);if(entry.key!=='study-session:'+e.end_at+':'+e.event_id||keys.has(entry.key))throw new Error('学习局标识无效或重复');keys.add(entry.key);}return b;}
-  root.TimeStudy={validateBackup,defaults,subjects,validateTask,capture,validateResult};
+  // Bounded recent-session evidence only; time alone never completes a mission.
+  function missionBoard(settings,sessions,now,timezone='Asia/Shanghai'){
+    const day=ms=>new Intl.DateTimeFormat('en-CA',{timeZone:timezone,year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(ms));
+    const today=day(now),ordered=[...sessions].sort((a,b)=>Date.parse(b.event.end_at)-Date.parse(a.event.end_at));
+    const done=key=>ordered.some(s=>s.event.event_key===key&&day(s.event.end_at)===today&&s.result?.completed===true);
+    const key=['math','cs408','english'].find(k=>!done(k))||'math';
+    const previous=ordered.find(s=>s.event.event_key===key&&s.result?.next?.trim());
+    const base=settings.tasks[key]||defaults().tasks[key];
+    const task={...base,goal:previous?previous.result.next:base.goal};
+    const review=ordered.find(s=>['math','cs408'].includes(s.event.event_key)&&s.result?.stage==='independent'&&day(s.event.end_at)!==today&&!ordered.some(n=>n.event.event_key===s.event.event_key&&['nextday','weekly'].includes(n.result?.stage)&&n.result.ids.trim()===s.result.ids.trim()&&Date.parse(n.event.start_at)>Date.parse(s.event.end_at)));
+    return {key,task,continued:!!previous,done:['math','cs408','english'].filter(done),mainDone:done('math')&&done('cs408'),review};
+  }
+  root.TimeStudy={missionBoard,validateBackup,defaults,subjects,validateTask,capture,validateResult};
 })(globalThis);
