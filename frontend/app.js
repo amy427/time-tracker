@@ -380,7 +380,9 @@ async function paintStudy(){
   const mission=studyMission,card=el('div',undefined,'study-task recommended');
   card.append(el('span',mission.mainDone?'今日主线已完成':'推荐下一局 · '+(mission.continued?'接着上次继续':'先把第一步做出来'),'eyebrow'),el('h3',mission.mainDone?'可以安心收工了':mission.task.title));
   if(mission.mainDone)card.append(el('p','数学、408 的标准任务已自评完成。休息和游戏都不需要用熬夜换取。','subtle'));
-  else {card.append(el('p',mission.task.goal),el('p','保底：8 分钟，只尝试第一步。标准：完成上面的目标。挑战：有余力再做一道变式，不必加时。','subtle'));const start=el('button','一键进局 · '+mission.task.minutes+' 分钟');start.disabled=!!snap?.conflict;start.onclick=()=>startStudy(mission.key,false,mission.task).catch(failed);card.append(start);}
+  else {card.append(el('p',mission.task.goal),el('p','保底：8 分钟，只尝试第一步。标准：完成上面的目标。挑战：有余力再做一道变式，不必加时。','subtle'));const start=el('button','一键进局 · '+mission.task.minutes+' 分钟');start.disabled=!!snap?.conflict;start.onclick=()=>startStudy(mission.key,false,mission.task).catch(failed);card.append(start);
+    const challenge=el('details',undefined,'study-challenge'),label=el('summary','可选挑战 · 展开查看');challenge.append(label,el('p',TimeStudy.challenge(mission.key)),el('p','完成标准任务后，有余力再尝试。沿用本局计时，不增加时长；到点可以直接撤离，未完成不扣分。','subtle'));card.append(challenge);
+  }
   box.append(card);
   const alternatives=el('details'),summary=el('summary','自主选择其他任务');alternatives.append(summary);
   for(const key of ['math','cs408','english']){const task=settings.tasks[key]||TimeStudy.defaults().tasks[key],button=el('button',task.title+' · '+task.minutes+' 分钟','quiet');button.disabled=!!snap?.conflict;button.onclick=()=>startStudy(key).catch(failed);alternatives.append(button);}box.append(alternatives);

@@ -13,3 +13,5 @@ label{display:block;margin:16px 0;font-size:13px;color:var(--muted)}input,select
 @media(prefers-reduced-motion:no-preference){button{transition:background-color .15s,color .15s,box-shadow .15s}button:not(:disabled):active{filter:brightness(.94)}}
 
 .study-tasks{display:flex;flex-direction:column}.study-tasks details button{margin:6px}.study-task.recommended{border-color:var(--blue)}#study-completed{width:22px;min-height:22px}#app-update{display:block;margin:12px auto}#app-update[hidden]{display:none}
+
+.study-challenge{margin:16px 0 0;padding:12px 0 0}.study-challenge summary{color:var(--blue);min-height:44px;padding:10px 0}.study-challenge p{font-size:14px;line-height:1.7}

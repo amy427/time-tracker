@@ -24,6 +24,9 @@
     if(['independent','nextday','weekly'].includes(r.stage)&&(!r.ids.trim()||!r.correct))throw new Error('通过验收需填写具体题号和独立正确题数');
   }
   function validateBackup(b){if(b?.version!==1||b.kind!=='study-backup'||!Array.isArray(b.sessions)||b.sessions.length>100000)throw new Error('学习备份格式无效');for(const k of subjects)validateTask(b.settings?.tasks?.[k]);const keys=new Set();for(const entry of b.sessions){const e=TimeCore.validateEvent(entry.event);validateTask(entry.task);if(entry.result)validateResult(entry.result);if(entry.key!=='study-session:'+e.end_at+':'+e.event_id||keys.has(entry.key))throw new Error('学习局标识无效或重复');keys.add(entry.key);}return b;}
+  function challenge(key){
+    return ({math:'从当前章节选 1 道没做过的变式题，先不看答案独立尝试，再写一句：它与刚才的题有什么不同。',cs408:'改变刚才题目的 1 个条件，先预测结果，再用推导、例子或反例验证，并解释为什么。',english:'从今天材料选 1 个句子，遮住原文复述含义，再用其中一个表达写自己的句子。',cs50p:'给当前代码补 1 个边界测试，先预测输出，再运行检查。'})[key]||'选一个刚学过的知识点，用一个新例子检验自己的理解。';
+  }
   // Bounded recent-session evidence only; time alone never completes a mission.
   function missionBoard(settings,sessions,now,timezone='Asia/Shanghai'){
     const day=ms=>new Intl.DateTimeFormat('en-CA',{timeZone:timezone,year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(ms));
@@ -36,5 +39,5 @@
     const review=ordered.find(s=>['math','cs408'].includes(s.event.event_key)&&s.result?.stage==='independent'&&day(s.event.end_at)!==today&&!ordered.some(n=>n.event.event_key===s.event.event_key&&['nextday','weekly'].includes(n.result?.stage)&&n.result.ids.trim()===s.result.ids.trim()&&Date.parse(n.event.start_at)>Date.parse(s.event.end_at)));
     return {key,task,continued:!!previous,done:['math','cs408','english'].filter(done),mainDone:done('math')&&done('cs408'),review};
   }
-  root.TimeStudy={missionBoard,validateBackup,defaults,subjects,validateTask,capture,validateResult};
+  root.TimeStudy={challenge,missionBoard,validateBackup,defaults,subjects,validateTask,capture,validateResult};
 })(globalThis);
